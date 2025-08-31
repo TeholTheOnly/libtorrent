@@ -373,6 +373,10 @@ std::string curl_tracker_client::build_tracker_query(tracker_request const& req,
 {
 	std::string query;
 	
+	// Pre-allocate space to avoid reallocations (optimize string building)
+	// Estimated size: info_hash(60) + peer_id(60) + numbers(100) + extras(100) = ~320 bytes
+	query.reserve(scrape ? 70 : 400);
+	
 	// Info hash (required for both announce and scrape)
 	query += "info_hash=";
 	query += libtorrent::escape_string({req.info_hash.data(), 20});
@@ -382,7 +386,7 @@ std::string curl_tracker_client::build_tracker_query(tracker_request const& req,
 		return query;
 	}
 	
-	// Announce parameters
+	// Announce parameters - build efficiently with pre-allocated buffer
 	query += "&peer_id=";
 	query += libtorrent::escape_string({req.pid.data(), 20});
 	query += "&port=" + std::to_string(req.listen_port);
@@ -403,7 +407,7 @@ std::string curl_tracker_client::build_tracker_query(tracker_request const& req,
 		}
 	}
 	
-	// Add compact and no_peer_id for efficiency (BEP-23 and BEP-3)
+	// BEP-23: Compact Peer Lists - Request compact response format
 	query += "&compact=1";      // Prefer compact response format
 	query += "&no_peer_id=1";   // Don't need peer IDs in response
 	
@@ -417,13 +421,14 @@ std::string curl_tracker_client::build_tracker_query(tracker_request const& req,
 	
 	query += "&numwant=" + std::to_string(req.num_want);
 	
-	// Add IP if specified (simplified - tracker usually knows the client IP)
+	// BEP-7: IPv6 Tracker Extension - Support both IPv4 and IPv6
+	// Add IP if specified (tracker usually knows the client IP)
 	if (!req.ipv4.empty()) {
 		query += "&ip=";
 		query += libtorrent::escape_string(req.ipv4[0].to_string());
 	}
 	
-	// IPv6 support
+	// IPv6 support - announce IPv6 address if available
 	if (!req.ipv6.empty()) {
 		query += "&ipv6=";
 		query += libtorrent::escape_string(req.ipv6[0].to_string());

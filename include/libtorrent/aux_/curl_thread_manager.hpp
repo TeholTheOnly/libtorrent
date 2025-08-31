@@ -41,6 +41,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/aux_/session_settings.hpp"
 #include "libtorrent/error_code.hpp"
 #include "libtorrent/time.hpp"
+#include "libtorrent/deadline_timer.hpp"
 #include <curl/curl.h>
 #include <memory>
 #include <thread>
@@ -65,7 +66,6 @@ struct response_data {
 
 // Request wrapper for thread communication
 struct curl_request {
-    CURL* easy_handle = nullptr;
     std::string url;
     // Updated to use shared_ptr<response_data> for dynamic size limiting and memory safety
     std::shared_ptr<response_data> response;
@@ -74,6 +74,15 @@ struct curl_request {
     int retry_count = 0;
     int max_retries = 3;
     milliseconds retry_delay{1000};  // Initial retry delay (exponential backoff)
+};
+
+// Forward declaration for curl_transfer_data
+struct curl_transfer_data;
+
+// RAII context for request lifetime management
+struct curl_request_context {
+    std::shared_ptr<curl_transfer_data> transfer_data;
+    curl_request request;
 };
 
 class TORRENT_EXPORT curl_thread_manager : public std::enable_shared_from_this<curl_thread_manager> {
@@ -117,6 +126,11 @@ private:
     
     // Wakeup the curl thread (requires libcurl 7.68.0+)
     void wakeup_curl_thread();
+    
+    // New timer-based batching methods
+    void process_queue_notification();
+    void on_timer(boost::system::error_code const& ec);
+    void perform_wakeup();
     
 private:
     // Memory pool for response buffers with fine-grained locking
@@ -225,10 +239,17 @@ private:
     std::atomic<CURLM*> m_multi_handle{nullptr};
     
     // Shutdown control
-    std::atomic<bool> m_stopping{false};
+    std::atomic<bool> m_shutting_down{false};
+    
+    // Timer-based wakeup batching mechanism
+    static constexpr auto WAKEUP_DELAY = std::chrono::milliseconds(5);
+    deadline_timer m_wakeup_timer;              // Accessed ONLY on IO thread
+    bool m_timer_running = false;               // Accessed ONLY on IO thread  
+    std::atomic<bool> m_notification_pending{false}; // Cross-thread notification
     
     // Active requests tracking (only accessed from curl thread)
-    std::unordered_map<CURL*, curl_request> m_active_requests;
+    // Uses shared_ptr for automatic memory management
+    std::unordered_map<CURL*, std::shared_ptr<curl_request_context>> m_active_requests;
     
     // Retry queue (only accessed from curl thread)
     // Using multiset for safe element extraction without const_cast
