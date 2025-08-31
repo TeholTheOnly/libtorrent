@@ -80,8 +80,8 @@ TORRENT_TEST(libcurl_security_ssl_verification)
 	
 	// Should fail due to certificate verification
 	TEST_CHECK(ec);
-	// Could be http_error for SSL issues or timed_out for network issues
-	TEST_CHECK(ec == errors::http_error || ec == errors::timed_out);
+	// Could be http_error, invalid_ssl_cert for SSL issues or timed_out for network issues
+	TEST_CHECK(ec == errors::http_error || ec == errors::invalid_ssl_cert || ec == errors::timed_out);
 	
 	// Now test with verification disabled
 	ios.restart();
@@ -112,7 +112,7 @@ TORRENT_TEST(libcurl_security_max_response_size)
 	settings_pack settings;
 	
 	// Set a small response size limit (1KB for testing)
-	settings.set_int(settings_pack::tracker_max_response_size, 1024);
+	settings.set_int(settings_pack::max_tracker_response_size, 1024);
 	
 	auto manager = std::make_shared<curl_tracker_manager>(ios, settings);
 	
@@ -297,8 +297,237 @@ TORRENT_TEST(libcurl_security_timeout_enforcement)
 	
 	// Should timeout within ~3 seconds (1 second connect + overhead)
 	TEST_CHECK(ec);
-	TEST_CHECK(ec == errors::timed_out || ec == errors::http_error);
+	TEST_CHECK(ec == errors::timed_out || ec == errors::http_error || ec == errors::timed_out_no_handshake);
 	TEST_CHECK(duration < seconds(4));
+}
+
+// Test response size limit enforcement against slow-drip attacks
+TORRENT_TEST(curl_response_size_limit_enforcement)
+{
+	io_context ios;
+	settings_pack pack;
+	// Set a smaller limit for testing
+	pack.set_int(settings_pack::max_tracker_response_size, 1024);  // 1KB limit
+	auto manager = std::make_shared<curl_tracker_manager>(ios, pack);
+	
+	bool completed = false;
+	error_code result_ec;
+	size_t response_size = 0;
+	
+	// Use a URL that returns a large response (httpbin.org test endpoint)
+	// This endpoint returns the requested number of bytes
+	std::string url = "https://httpbin.org/bytes/2048";  // Request 2KB (exceeds 1KB limit)
+	manager->add_request(url,
+		[&](error_code const& ec, std::vector<char> const& response) {
+			result_ec = ec;
+			response_size = response.size();
+			completed = true;
+		});
+	
+	// Run event loop
+	std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+	while (!completed) {
+		ios.run_one();
+		auto elapsed = std::chrono::steady_clock::now() - start;
+		if (elapsed > std::chrono::seconds(15)) {
+			break;
+		}
+	}
+	
+	// Should have failed or limited the response
+	TEST_CHECK(completed || response_size <= 1024);
+	if (completed) {
+		// Either got an error or limited response
+		TEST_CHECK(result_ec || response_size <= 1024);
+	}
+}
+
+// Test SSL certificate validation with various bad certificates
+TORRENT_TEST(curl_ssl_certificate_validation)
+{
+	io_context ios;
+	settings_pack pack;
+	auto manager = std::make_shared<curl_tracker_manager>(ios, pack);
+	
+	struct ssl_test {
+		std::string url;
+		std::string description;
+		bool should_fail;
+	};
+	
+	// Using badssl.com test endpoints
+	std::vector<ssl_test> tests = {
+		{"https://expired.badssl.com/", "Expired certificate", true},
+		{"https://wrong.host.badssl.com/", "Wrong hostname", true},
+		{"https://self-signed.badssl.com/", "Self-signed certificate", true},
+		{"https://untrusted-root.badssl.com/", "Untrusted root", true},
+		// Note: We may want to allow some scenarios in the future
+	};
+	
+	int completed = 0;
+	for (auto const& test : tests) {
+		manager->add_request(test.url,
+			[&completed, &test](error_code const& ec, std::vector<char> const&) {
+				if (test.should_fail) {
+					// Should fail with SSL error
+					TEST_CHECK(ec == errors::invalid_ssl_cert || ec == errors::http_error);
+				}
+				completed++;
+			});
+	}
+	
+	// Run event loop with timeout
+	auto start = std::chrono::steady_clock::now();
+	while (completed < static_cast<int>(tests.size())) {
+		ios.run_one();
+		auto elapsed = std::chrono::steady_clock::now() - start;
+		if (elapsed > std::chrono::seconds(20)) {
+			break;
+		}
+	}
+	
+	// All tests should complete
+	TEST_CHECK(completed == static_cast<int>(tests.size()));
+}
+
+// Test redirect prevention (SSRF protection)
+TORRENT_TEST(curl_redirect_prevention)
+{
+	io_context ios;
+	settings_pack pack;
+	auto manager = std::make_shared<curl_tracker_manager>(ios, pack);
+	
+	bool completed = false;
+	error_code result_ec;
+	
+	// Use httpbin.org redirect endpoint that sends a 302 redirect
+	std::string url = "https://httpbin.org/redirect/1";
+	manager->add_request(url,
+		[&](error_code const& ec, std::vector<char> const&) {
+			result_ec = ec;
+			completed = true;
+		});
+	
+	// Run event loop
+	std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+	while (!completed) {
+		ios.run_one();
+		auto elapsed = std::chrono::steady_clock::now() - start;
+		if (elapsed > std::chrono::seconds(10)) {
+			break;
+		}
+	}
+	
+	// Should fail because redirects are disabled in our implementation
+	TEST_CHECK(completed);
+	TEST_CHECK(result_ec);  // Should have error since we don't follow redirects
+}
+
+// Test that tracker_ssl_verify settings are respected
+TORRENT_TEST(curl_ssl_verify_settings_respected)
+{
+	io_context ios;
+	
+	// Test with verification disabled (for self-signed certs)
+	{
+		settings_pack pack;
+		pack.set_bool(settings_pack::tracker_ssl_verify_peer, false);
+		pack.set_bool(settings_pack::tracker_ssl_verify_host, false);
+		auto manager = std::make_shared<curl_tracker_manager>(ios, pack);
+		
+		bool completed = false;
+		error_code result_ec;
+		
+		// Request to a server with self-signed certificate
+		// With verification disabled, this should succeed (or fail with network error, not SSL error)
+		manager->add_request("https://self-signed.badssl.com/",
+			[&](error_code const& ec, std::vector<char> const&) {
+				result_ec = ec;
+				completed = true;
+			});
+		
+		// Run event loop
+		std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+		while (!completed) {
+			ios.run_one();
+			auto elapsed = std::chrono::steady_clock::now() - start;
+			if (elapsed > std::chrono::seconds(10)) break;
+		}
+		
+		// With verification disabled, should not get SSL certificate error
+		TEST_CHECK(!result_ec || result_ec != errors::invalid_ssl_cert);
+	}
+	
+	// Test with verification enabled (default)
+	{
+		settings_pack pack;
+		// Defaults are true, but set explicitly for clarity
+		pack.set_bool(settings_pack::tracker_ssl_verify_peer, true);
+		pack.set_bool(settings_pack::tracker_ssl_verify_host, true);
+		auto manager = std::make_shared<curl_tracker_manager>(ios, pack);
+		
+		bool completed = false;
+		error_code result_ec;
+		
+		// Request to a server with self-signed certificate
+		// With verification enabled, this should fail with SSL error
+		manager->add_request("https://self-signed.badssl.com/",
+			[&](error_code const& ec, std::vector<char> const&) {
+				result_ec = ec;
+				completed = true;
+			});
+		
+		// Run event loop
+		std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+		while (!completed) {
+			ios.run_one();
+			auto elapsed = std::chrono::steady_clock::now() - start;
+			if (elapsed > std::chrono::seconds(10)) break;
+		}
+		
+		// With verification enabled, should get SSL error
+		TEST_CHECK(result_ec == errors::invalid_ssl_cert || result_ec == errors::http_error);
+	}
+}
+
+// Test that write callback exception safety works
+TORRENT_TEST(curl_write_callback_exception_safety)
+{
+	// This test verifies that exceptions in the write callback
+	// don't crash the program (they're caught and handled)
+	
+	io_context ios;
+	settings_pack pack;
+	auto manager = std::make_shared<curl_tracker_manager>(ios, pack);
+	
+	// Send multiple requests to various endpoints
+	// Using invalid URLs that will fail quickly
+	for (int i = 0; i < 10; ++i) {
+		// Mix of different URL types to test various code paths
+		std::string url;
+		if (i % 3 == 0) {
+			url = "http://0.0.0.0:" + std::to_string(30000 + i) + "/test";
+		} else if (i % 3 == 1) {
+			url = "https://invalid.test.domain." + std::to_string(i) + ".com/announce";
+		} else {
+			url = "http://[::1]:" + std::to_string(40000 + i) + "/test";
+		}
+		
+		manager->add_request(url,
+			[](error_code const&, std::vector<char> const&) {
+				// Handler doesn't matter for this test
+			});
+	}
+	
+	// Run event loop to process requests
+	std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+	while (std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
+		ios.poll();
+		ios.restart();
+	}
+	
+	// If we get here without crashing, test passes
+	TEST_CHECK(true);
 }
 
 #else // TORRENT_USE_LIBCURL

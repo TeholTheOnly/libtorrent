@@ -179,6 +179,7 @@ namespace {
 		if (peers6_ent)
 		{
 			char const* peers = peers6_ent.string_ptr();
+			char const* peers_end = peers + peers6_ent.string_length();
 			int const len = peers6_ent.string_length();
 			
 			if (len % 18 != 0)
@@ -187,14 +188,22 @@ namespace {
 				return resp;
 			}
 			
-			for (int i = 0; i < len; i += 18)
+			// Fixed bounds checking and pointer advancement
+			for (int i = 0; i + 18 <= len && peers + 18 <= peers_end; i += 18)
 			{
+				// Ensure we have enough data before reading
+				if (peers + 18 > peers_end) break;
+				
 				peer_entry p;
 				address_v6::bytes_type addr_bytes;
 				std::memcpy(addr_bytes.data(), peers, 16);
 				p.hostname = address_v6(addr_bytes).to_string();
+				peers += 16;  // Critical: Advance pointer after reading address
+				
 				p.port = read_uint16(peers);
-				resp.peers.push_back(p);
+				peers += 2;   // Critical: Advance pointer after reading port
+				
+				resp.peers.push_back(std::move(p));
 			}
 		}
 		
@@ -387,10 +396,15 @@ std::string curl_tracker_client::build_tracker_query(tracker_request const& req,
 	
 	// Add event if not none
 	if (req.event != event_t::none) {
-		const char* event_str[] = {"empty", "completed", "started", "stopped", "paused"};
+		// BEP-3 compliant events only (removed non-standard "paused")
+		const char* event_str[] = {"empty", "completed", "started", "stopped"};
 		query += "&event=";
 		query += event_str[static_cast<int>(req.event)];
 	}
+	
+	// Add compact and no_peer_id for efficiency (BEP-23 and BEP-3)
+	query += "&compact=1";      // Prefer compact response format
+	query += "&no_peer_id=1";   // Don't need peer IDs in response
 	
 	// Optional parameters
 	if (req.key != 0) {
@@ -400,7 +414,6 @@ std::string curl_tracker_client::build_tracker_query(tracker_request const& req,
 		query += key_str;
 	}
 	
-	query += "&compact=1";
 	query += "&numwant=" + std::to_string(req.num_want);
 	
 	// Add IP if specified (simplified - tracker usually knows the client IP)

@@ -31,6 +31,7 @@ POSSIBILITY OF SUCH DAMAGE.
 */
 
 #include "test.hpp"
+#include "setup_transfer.hpp"
 #include "libtorrent/config.hpp"
 
 // Only compile these tests if libcurl support is enabled
@@ -351,7 +352,7 @@ TORRENT_TEST(curl_max_response_size)
 	settings_pack settings;
 
 	// Set a very small max response size
-	settings.set_int(settings_pack::tracker_max_response_size, 100);
+	settings.set_int(settings_pack::max_tracker_response_size, 100);
 
 	auto manager = std::make_shared<curl_tracker_manager>(ios, settings);
 
@@ -817,6 +818,169 @@ TORRENT_TEST(curl_proxy_disabled_for_trackers)
 		std::printf("DEBUG: future not ready after 5s\n");
 		TEST_CHECK(false);
 	}
+}
+
+// Stress test: Multiple concurrent announces
+TORRENT_TEST(curl_concurrent_announces)
+{
+	io_context ios;
+	settings_pack pack;
+	auto manager = std::make_shared<curl_tracker_manager>(ios, pack);
+	
+	constexpr int NUM_REQUESTS = 50;  // Reduced for faster test
+	std::atomic<int> completed_count{0};
+	std::atomic<int> error_count{0};
+	
+	// Use invalid URLs that will fail quickly
+	for (int i = 0; i < NUM_REQUESTS; ++i) {
+		// These URLs will fail, but test the concurrent handling
+		std::string url = "http://0.0.0.0:" + std::to_string(10000 + i) + 
+		                  "/announce?info_hash=" + std::to_string(i);
+		
+		manager->add_request(url,
+			[&completed_count, &error_count](error_code const& ec, std::vector<char> const&) {
+				if (ec) {
+					error_count++;
+				}
+				completed_count++;
+			});
+	}
+	
+	// Run event loop with timeout
+	auto start = std::chrono::steady_clock::now();
+	while (completed_count < NUM_REQUESTS) {
+		ios.run_one();
+		
+		// Timeout after 10 seconds
+		auto elapsed = std::chrono::steady_clock::now() - start;
+		if (elapsed > std::chrono::seconds(10)) {
+			break;
+		}
+	}
+	
+	// All requests should have failed (invalid addresses)
+	TEST_CHECK(error_count == NUM_REQUESTS);
+	TEST_CHECK(completed_count == NUM_REQUESTS);
+}
+
+// Test error recovery from various failure conditions
+TORRENT_TEST(curl_error_recovery)
+{
+	io_context ios;
+	settings_pack pack;
+	auto manager = std::make_shared<curl_tracker_manager>(ios, pack);
+	
+	struct test_case {
+		std::string url;
+		std::string description;
+		bool should_fail;
+	};
+	
+	std::vector<test_case> test_cases = {
+		{"http://0.0.0.0:1/announce", "Unreachable host", true},
+		{"http://invalid.hostname.that.does.not.exist/announce", "DNS failure", true},
+		{"http://[::1]:1/announce", "IPv6 unreachable", true},
+		{"https://expired.badssl.com/", "Expired SSL cert", true},
+		{"https://self-signed.badssl.com/", "Self-signed cert", true},
+		{"not-a-valid-url", "Malformed URL", true},
+		{"http://127.0.0.1:65536/announce", "Invalid port", true}
+	};
+	
+	int completed = 0;
+	for (auto const& tc : test_cases) {
+		manager->add_request(tc.url,
+			[&completed, &tc](error_code const& ec, std::vector<char> const&) {
+				if (tc.should_fail) {
+					TEST_CHECK(ec);  // Should have an error
+				} else {
+					TEST_CHECK(!ec);  // Should succeed
+				}
+				completed++;
+			});
+	}
+	
+	// Run with timeout
+	auto start = std::chrono::steady_clock::now();
+	while (completed < static_cast<int>(test_cases.size())) {
+		ios.run_one();
+		
+		auto elapsed = std::chrono::steady_clock::now() - start;
+		if (elapsed > std::chrono::seconds(15)) {
+			break;
+		}
+	}
+	
+	// All error cases should complete (with errors)
+	TEST_CHECK(completed == static_cast<int>(test_cases.size()));
+}
+
+// Test behavior under memory pressure
+TORRENT_TEST(curl_memory_pressure)
+{
+	io_context ios;
+	settings_pack pack;
+	
+	// Test repeated creation/destruction doesn't leak
+	for (int i = 0; i < 10; ++i) {
+		auto manager = std::make_shared<curl_tracker_manager>(ios, pack);
+		
+		// Add and immediately cancel requests
+		std::vector<CURL*> handles;
+		for (int j = 0; j < 50; ++j) {
+			auto* handle = manager->add_request(
+				"http://example.com/announce?i=" + std::to_string(j),
+				[](error_code const&, std::vector<char> const&) {});
+			handles.push_back(handle);
+		}
+		
+		// Cancel all
+		for (auto* h : handles) {
+			manager->cancel_request(h);
+		}
+		
+		// Let destructor clean up
+	}
+	
+	// If we get here without crashing/asserting, test passes
+	TEST_CHECK(true);
+}
+
+// Test rapid socket state changes
+TORRENT_TEST(curl_socket_state_transitions)
+{
+	io_context ios;
+	settings_pack pack;
+	auto manager = std::make_shared<curl_tracker_manager>(ios, pack);
+	
+	// Rapidly add and cancel requests to trigger socket state changes
+	for (int iteration = 0; iteration < 10; ++iteration) {
+		std::vector<CURL*> handles;
+		
+		// Add requests to invalid addresses (will fail quickly)
+		for (int i = 0; i < 10; ++i) {
+			auto* h = manager->add_request(
+				"http://0.0.0.0:" + std::to_string(20000 + i) + "/test?i=" + std::to_string(i),
+				[](error_code const&, std::vector<char> const&) {});
+			handles.push_back(h);
+		}
+		
+		// Run a few event loop iterations
+		for (int i = 0; i < 5; ++i) {
+			ios.poll();
+		}
+		
+		// Cancel half of them
+		for (size_t i = 0; i < handles.size() / 2; ++i) {
+			manager->cancel_request(handles[i]);
+		}
+		
+		// Run more iterations
+		for (int i = 0; i < 5; ++i) {
+			ios.poll();
+		}
+	}
+	
+	TEST_CHECK(true);  // Success if no crash/assert
 }
 
 #else // TORRENT_USE_LIBCURL

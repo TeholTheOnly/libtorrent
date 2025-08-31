@@ -1026,20 +1026,33 @@ namespace aux {
 			// man-in-the-middle connections.
 			proxy_send_host_in_connect,
 
-			// if true, tracker connections will attempt to use HTTP/2
-			// when available (requires libcurl with HTTP/2 support).
-			// HTTP/2 provides multiplexing and connection reuse for
-			// improved performance with many torrents.
+			// ``enable_http2_trackers`` determines whether to attempt HTTP/2
+			// connections to trackers when using libcurl for announces.
+			// HTTP/2 provides significant performance benefits through
+			// multiplexing (multiple requests over a single connection),
+			// header compression, and connection reuse. This is especially
+			// beneficial when announcing many torrents to the same tracker.
+			// This setting has no effect if libcurl is not available or
+			// was not built with HTTP/2 support. Default: true.
 			enable_http2_trackers,
 
-			// if true, tracker connections will verify the SSL certificate
-			// presented by the tracker. This should be enabled for security.
-			// Default: true
+			// ``tracker_ssl_verify_peer`` controls whether to verify the SSL/TLS
+			// certificate presented by HTTPS trackers. When enabled, the
+			// certificate must be valid and signed by a trusted certificate
+			// authority. Disabling this exposes connections to man-in-the-middle
+			// attacks and should only be done for testing with self-signed
+			// certificates. This setting only applies when using libcurl for
+			// tracker connections. Default: true.
 			tracker_ssl_verify_peer,
 
-			// if true, tracker connections will verify that the SSL certificate
-			// hostname matches the tracker hostname. This should be enabled
-			// for security. Default: true
+			// ``tracker_ssl_verify_host`` controls whether to verify that the
+			// hostname in the SSL/TLS certificate matches the hostname of the
+			// tracker being connected to. This prevents attacks where a valid
+			// certificate for a different domain is presented. Disabling this
+			// check significantly weakens security and should only be done for
+			// testing. This setting requires ``tracker_ssl_verify_peer`` to be
+			// enabled to have any effect. Only applies when using libcurl.
+			// Default: true.
 			tracker_ssl_verify_host,
 
 			max_bool_setting_internal
@@ -2116,28 +2129,76 @@ namespace aux {
 			i2p_inbound_length_variance,
 			i2p_outbound_length_variance,
 
-			// HTTP/2 tracker connection pool settings
-			// Maximum number of HTTP/2 connections in the pool
+			// ``http2_max_pool_size`` is the maximum number of HTTP/2 connections
+			// that can be maintained in the global connection pool when using
+			// libcurl for tracker announces. Since HTTP/2 supports multiplexing
+			// many requests over a single connection, this can be relatively
+			// small while still supporting many concurrent announces. Lower
+			// values reduce memory usage but may limit parallelism when
+			// announcing to many different tracker hosts. Default: 10.
+			// This setting requires libcurl built with HTTP/2 support.
 			http2_max_pool_size,
-			// Maximum number of HTTP/2 connections per host
+			// ``http2_max_connections_per_host`` limits the number of HTTP/2
+			// connections that can be established to a single tracker host.
+			// Since HTTP/2 supports multiplexing many streams over a single
+			// connection, typically only 1-2 connections per host are needed
+			// for optimal performance. Higher values may be useful if a tracker
+			// limits the number of concurrent streams per connection.
+			// Default: 2. This setting requires libcurl with HTTP/2 support.
 			http2_max_connections_per_host,
-			// Maximum number of pending connection operations
+			// ``http2_max_pending_operations`` is the maximum number of pending
+			// connection operations that can be queued when establishing new
+			// HTTP/2 connections to trackers. This includes DNS lookups, SSL
+			// handshakes, and protocol negotiation. If this limit is reached,
+			// additional connection attempts will be queued. Lower values may
+			// cause delays when many torrents start simultaneously.
+			// Default: 100. This setting requires libcurl with HTTP/2 support.
 			http2_max_pending_operations,
-			// Idle timeout for HTTP/2 connections (seconds)
+			// ``http2_idle_timeout`` is the number of seconds an idle HTTP/2
+			// connection to a tracker will be kept open before being closed.
+			// Keeping connections open improves performance by avoiding the
+			// overhead of repeated SSL handshakes and protocol negotiation,
+			// but consumes system resources (file descriptors and memory).
+			// Setting this to 0 disables connection reuse entirely.
+			// Default: 60 seconds. This setting requires libcurl with HTTP/2.
 			http2_idle_timeout,
-			// Maximum concurrent streams per HTTP/2 connection
+			// ``http2_max_concurrent_streams`` sets the maximum number of
+			// concurrent streams (requests) that can be multiplexed over a
+			// single HTTP/2 connection. This value is negotiated with the
+			// tracker server, which may impose its own lower limit. Higher
+			// values allow more announces to be sent simultaneously over
+			// each connection. Setting this too high may cause tracker
+			// servers to reject connections. Default: 100.
+			// This setting requires libcurl with HTTP/2 support.
 			http2_max_concurrent_streams,
-			// HTTP/2 protocol cache TTL for successful negotiation (hours)
-			// Default: 168 hours (7 days)
+			// ``http2_protocol_cache_success_ttl`` is the number of hours to
+			// cache successful HTTP/2 protocol negotiation results for a
+			// tracker host. When a tracker is known to support HTTP/2, this
+			// cache prevents unnecessary protocol negotiation on subsequent
+			// connections, improving connection establishment time. Setting
+			// this to 0 disables caching and forces protocol negotiation
+			// for every new connection. Default: 168 hours (7 days).
+			// This setting requires libcurl with HTTP/2 support.
 			http2_protocol_cache_success_ttl,
-			// HTTP/2 protocol cache TTL for failed negotiation (hours)
-			// Default: 24 hours (1 day)
+			// ``http2_protocol_cache_failure_ttl`` is the number of hours to
+			// cache failed HTTP/2 protocol negotiation results for a tracker
+			// host. When a tracker is known not to support HTTP/2, this cache
+			// prevents repeated failed negotiation attempts, falling back to
+			// HTTP/1.1 immediately. This is typically shorter than the success
+			// TTL since tracker configurations may change to add HTTP/2 support.
+			// Setting this to 0 disables caching of failures. Default: 24 hours.
+			// This setting requires libcurl with HTTP/2 support.
 			http2_protocol_cache_failure_ttl,
 
-			// Maximum size in bytes for tracker HTTP responses.
-			// Responses larger than this will be rejected.
-			// Default: 10485760 (10 MB)
-			tracker_max_response_size,
+			// ``max_tracker_response_size`` is the maximum size in bytes that
+			// a tracker HTTP response is allowed to be. Responses larger than
+			// this limit will be rejected and treated as errors. This protects
+			// against memory exhaustion attacks from malicious or misconfigured
+			// trackers sending excessively large responses. This applies to all
+			// tracker responses including scrape responses. Setting this too
+			// low may prevent legitimate trackers with many peers from working.
+			// Default: 10485760 (10 MB). This setting is used with libcurl.
+			max_tracker_response_size,
 
 			// Minimum TLS version for tracker HTTPS connections.
 			// 0 = TLS 1.0, 1 = TLS 1.1, 2 = TLS 1.2, 3 = TLS 1.3

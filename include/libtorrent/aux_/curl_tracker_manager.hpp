@@ -48,22 +48,32 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <map>
 #include <vector>
 #include <functional>
+#include <atomic>
 
-#ifndef TORRENT_WINDOWS
+#ifdef TORRENT_WINDOWS
+// For event-based socket monitoring without ownership
+#include <boost/asio/windows/object_handle.hpp>
+#include <winsock2.h>
+#else
 // For monitoring curl's file descriptors without taking ownership
 #include <boost/asio/posix/stream_descriptor.hpp>
 #endif
 
 namespace libtorrent { namespace aux {
 
-// Platform-specific socket monitor type
-// Windows must use tcp::socket (with careful ownership handling)
-// POSIX can use stream_descriptor (non-owning fd monitoring)
-#ifdef TORRENT_WINDOWS
-using platform_socket_monitor = boost::asio::ip::tcp::socket;
-#else
-using platform_socket_monitor = boost::asio::posix::stream_descriptor;
-#endif
+// RAII wrappers for libcurl handles
+struct curl_multi_deleter {
+	void operator()(CURLM* m) const {
+		if (m) curl_multi_cleanup(m);
+	}
+};
+
+struct curl_share_deleter {
+	void operator()(CURLSH* s) const {
+		if (s) curl_share_cleanup(s);
+	}
+};
+
 
 // Direct integration with libcurl multi interface
 // Manages socket callbacks and timer integration with Boost.Asio
@@ -99,10 +109,23 @@ private:
 	void timer_expired(error_code const& ec);
 	void check_multi_info();
 	
-	// Socket management
+	// Socket management with platform-specific monitoring
 	struct socket_info {
-		explicit socket_info(io_context& ios) : monitor(ios) {}
-		platform_socket_monitor monitor;
+		explicit socket_info(io_context& ios);
+		~socket_info();
+		
+#ifdef TORRENT_WINDOWS
+		// Windows: Event-based monitoring without ownership
+		boost::asio::windows::object_handle event_handle;
+		curl_socket_t socket_fd = INVALID_SOCKET;  // Store socket for WSAEventSelect
+		
+		// Setup/update event monitoring (non-owning)
+		void setup_event_monitor(curl_socket_t sock, int what);
+		void cleanup_event_monitor();
+#else
+		// POSIX: Use duplicated fd with stream_descriptor
+		boost::asio::posix::stream_descriptor monitor;
+#endif
 		
 		// Separate intent (what curl wants) from action (what Asio is doing)
 		bool wants_read = false;   // Intent: curl requested CURL_POLL_IN
@@ -128,11 +151,20 @@ private:
 	// Robust asynchronous I/O loop with proper continuation
 	void manage_io_loop(curl_socket_t sock, std::shared_ptr<socket_info> info, int direction);
 	
+#if TORRENT_USE_INVARIANT_CHECKS
+	// Verify internal state consistency
+	void check_invariant() const;
+#endif
+	
 private:
+	// RAII type aliases for libcurl handles
+	using curl_multi_handle = std::unique_ptr<CURLM, curl_multi_deleter>;
+	using curl_share_handle = std::unique_ptr<CURLSH, curl_share_deleter>;
+	
 	io_context& m_ios;
-	CURLM* m_multi;         // curl multi handle
-	CURLSH* m_share;        // curl share handle for connection pooling
-	deadline_timer m_timer; // timeout timer
+	curl_multi_handle m_multi;    // curl multi handle with RAII
+	curl_share_handle m_share;    // curl share handle with RAII
+	deadline_timer m_timer;        // timeout timer
 	
 	std::map<curl_socket_t, std::shared_ptr<socket_info>> m_sockets;
 	std::unordered_map<CURL*, std::unique_ptr<request_info>> m_requests;
@@ -140,7 +172,7 @@ private:
 	int m_still_running;
 	settings_pack m_settings;
 	bool m_http2_supported;
-	bool m_shutting_down;   // Flag to prevent callbacks during destruction
+	std::atomic<bool> m_shutting_down;   // Thread-safe flag to prevent callbacks during destruction
 };
 
 }} // namespace libtorrent::aux

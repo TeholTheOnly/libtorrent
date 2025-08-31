@@ -416,7 +416,7 @@ constexpr int DISK_WRITE_MODE = settings_pack::enable_os_cache;
 		SET(http2_max_concurrent_streams, 100, nullptr),
 		SET(http2_protocol_cache_success_ttl, 168, nullptr),
 		SET(http2_protocol_cache_failure_ttl, 24, nullptr),
-		SET(tracker_max_response_size, 10485760, nullptr),
+		SET(max_tracker_response_size, 10485760, nullptr),
 		SET(tracker_min_tls_version, 2, nullptr)
 	}});
 

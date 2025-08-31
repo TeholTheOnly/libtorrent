@@ -342,8 +342,6 @@ set(sources
 	curl_tracker_connection.cpp
 	http2_errors.cpp
 	aux_/tracker_http_client.cpp
-	aux_/http1_tracker_client.cpp
-	aux_/http2_ssl_config.cpp
 	aux_/curl_tracker_manager.cpp
 	aux_/curl_tracker_client.cpp
 	i2p_stream.cpp

@@ -57,8 +57,8 @@ curl_tracker_connection::curl_tracker_connection(
 		session_sett.get_int(settings_pack::tracker_completion_timeout));
 	sett.set_int(settings_pack::tracker_receive_timeout,
 		session_sett.get_int(settings_pack::tracker_receive_timeout));
-	sett.set_int(settings_pack::tracker_max_response_size,
-		session_sett.get_int(settings_pack::tracker_max_response_size));
+	sett.set_int(settings_pack::max_tracker_response_size,
+		session_sett.get_int(settings_pack::max_tracker_response_size));
 	sett.set_bool(settings_pack::tracker_ssl_verify_peer,
 		session_sett.get_bool(settings_pack::tracker_ssl_verify_peer));
 	sett.set_bool(settings_pack::tracker_ssl_verify_host,
