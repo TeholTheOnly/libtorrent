@@ -1,5 +1,4 @@
 #include "test.hpp"
-#include "libtorrent/aux_/tracker_http_client.hpp"
 #include "libtorrent/aux_/mock_tracker_client.hpp"
 #include "libtorrent/tracker_manager.hpp"
 #include "libtorrent/io_context.hpp"
@@ -151,20 +150,6 @@ TORRENT_TEST(tracker_close_behavior)
 
     auto ec = future.get();
     TEST_CHECK(ec);  // Should have error
-}
-
-// Test factory function
-TORRENT_TEST(tracker_factory_http1)
-{
-    io_context ios;
-    settings_pack settings;
-    settings.set_bool(settings_pack::enable_outgoing_utp, false); // Use existing setting as placeholder
-
-    auto client = create_tracker_client(ios,
-        "http://tracker.example.com/announce", settings);
-
-    TEST_CHECK(client != nullptr);
-    TEST_CHECK(client->can_reuse());
 }
 
 // Test error propagation

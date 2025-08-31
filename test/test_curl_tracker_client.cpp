@@ -329,6 +329,127 @@ TORRENT_TEST(curl_tracker_client_invalid_url)
 	ios.run_for(1s);
 }
 
+// Test 11: IPv6 peer parsing fuzzing - security hardening
+TORRENT_TEST(curl_tracker_client_ipv6_parsing_fuzzing)
+{
+	io_context ios;
+	settings_pack settings;
+	std::string tracker_url = "http://tracker.example.com/announce";
+	auto client = std::make_unique<curl_tracker_client>(ios, tracker_url, settings);
+	
+	// Test 1: Empty input
+	{
+		entry resp;
+		resp["peers6"] = std::string("");
+		
+		std::vector<char> buffer;
+		bencode(std::back_inserter(buffer), resp);
+		
+		error_code ec;
+		tracker_response parsed = aux::parse_announce_response(
+			span<char const>(buffer.data(), buffer.size()), ec);
+		TEST_CHECK(parsed.peers.empty()); // Should handle empty gracefully
+	}
+	
+	// Test 2: Length not multiple of 18
+	{
+		entry resp;
+		resp["peers6"] = std::string(17, 'x'); // 17 bytes - invalid
+		
+		std::vector<char> buffer;
+		bencode(std::back_inserter(buffer), resp);
+		
+		error_code ec;
+		tracker_response parsed = aux::parse_announce_response(
+			span<char const>(buffer.data(), buffer.size()), ec);
+		TEST_CHECK(parsed.peers.empty()); // Should reject invalid length
+	}
+	
+	// Test 3: Valid single IPv6 peer (18 bytes)
+	{
+		entry resp;
+		std::string peer_data(18, '\0');
+		// Set some recognizable bytes
+		peer_data[0] = 0x20; peer_data[1] = 0x01; // IPv6 prefix
+		peer_data[16] = 0x1A; peer_data[17] = 0xE1; // Port 6881
+		resp["peers6"] = peer_data;
+		
+		std::vector<char> buffer;
+		bencode(std::back_inserter(buffer), resp);
+		
+		error_code ec;
+		tracker_response parsed = aux::parse_announce_response(
+			span<char const>(buffer.data(), buffer.size()), ec);
+		TEST_CHECK(!ec);
+		TEST_EQUAL(parsed.peers.size(), 1);
+		if (!parsed.peers.empty()) {
+			TEST_EQUAL(parsed.peers[0].port, 6881);
+		}
+	}
+	
+	// Test 4: Multiple valid IPv6 peers
+	{
+		entry resp;
+		std::string peer_data(18 * 3, '\0'); // 3 peers
+		for (int i = 0; i < 3; ++i) {
+			int offset = i * 18;
+			peer_data[offset] = 0x20;
+			peer_data[offset + 1] = 0x01;
+			peer_data[offset + 16] = 0x1A;
+			peer_data[offset + 17] = 0xE1 + i; // Different ports
+		}
+		resp["peers6"] = peer_data;
+		
+		std::vector<char> buffer;
+		bencode(std::back_inserter(buffer), resp);
+		
+		error_code ec;
+		tracker_response parsed = aux::parse_announce_response(
+			span<char const>(buffer.data(), buffer.size()), ec);
+		TEST_CHECK(!ec);
+		TEST_EQUAL(parsed.peers.size(), 3);
+	}
+	
+	// Test 5: Extremely large input (memory exhaustion test)
+	{
+		entry resp;
+		// 1000 peers = 18000 bytes - should handle gracefully
+		std::string peer_data(18 * 1000, '\x01');
+		resp["peers6"] = peer_data;
+		
+		std::vector<char> buffer;
+		bencode(std::back_inserter(buffer), resp);
+		
+		error_code ec;
+		tracker_response parsed = aux::parse_announce_response(
+			span<char const>(buffer.data(), buffer.size()), ec);
+		TEST_CHECK(!ec); // Should handle large inputs
+		TEST_EQUAL(parsed.peers.size(), 1000);
+	}
+	
+	// Test 6: Mixed with IPv4 peers
+	{
+		entry resp;
+		// Add both IPv4 and IPv6 peers
+		std::string ipv4_data(6 * 2, '\0'); // 2 IPv4 peers
+		ipv4_data[4] = 0x1A; ipv4_data[5] = 0xE1; // Port
+		ipv4_data[10] = 0x1A; ipv4_data[11] = 0xE2;
+		resp["peers"] = ipv4_data;
+		
+		std::string ipv6_data(18 * 2, '\0'); // 2 IPv6 peers
+		resp["peers6"] = ipv6_data;
+		
+		std::vector<char> buffer;
+		bencode(std::back_inserter(buffer), resp);
+		
+		error_code ec;
+		tracker_response parsed = aux::parse_announce_response(
+			span<char const>(buffer.data(), buffer.size()), ec);
+		TEST_CHECK(!ec);
+		TEST_EQUAL(parsed.peers.size(), 4); // 2 IPv4 + 2 IPv6
+	}
+}
+
 #else // TORRENT_USE_LIBCURL
 
 // If libcurl is not available, provide a dummy test

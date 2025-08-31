@@ -222,6 +222,8 @@ rule linking ( properties * )
 	}
 
 	# Add libcurl for HTTP/2 tracker support
+	# IMPORTANT: Requires libcurl 7.68.0 or newer for curl_multi_wakeup support
+	# The version check is enforced at runtime in curl_thread_manager.cpp
 	result += <library>curl ;
 	result += <define>TORRENT_USE_LIBCURL ;
 
@@ -734,7 +736,35 @@ lib gnutls : : <name>gnutls <conditional>@gnutls-lib-path : :
 lib wolfssl : : <name>wolfssl <conditional>@wolfssl-lib-path : :
 	<conditional>@wolfssl-include-path ;
 
-# libcurl for HTTP/2 tracker support
+# libcurl for HTTP/2 tracker support (requires 7.68.0+ for curl_multi_wakeup)
+# Check libcurl version using pkg-config
+rule check-curl-version ( properties * )
+{
+    local result ;
+
+    # Try pkg-config for version detection
+    local curl-version = [ SHELL "pkg-config --modversion libcurl 2>/dev/null || echo '0.0.0'" ] ;
+
+    # Simple version check - extract major.minor
+    local version-ok = [ SHELL "pkg-config --atleast-version=7.68.0 libcurl 2>/dev/null && echo 'yes' || echo 'no'" ] ;
+
+    if $(version-ok) = "yes"
+    {
+        # Version is acceptable, enable libcurl
+        result += <source>curl ;
+    }
+    else
+    {
+        # Print warning and allow build to continue (will fail at compile time if TORRENT_USE_LIBCURL is defined)
+        # This allows builds without curl support to succeed
+        ECHO "WARNING: libcurl version 7.68.0+ not found (found: $(curl-version))" ;
+        ECHO "         HTTP/2 tracker support via libcurl will be disabled" ;
+        ECHO "         To enable, upgrade libcurl to 7.68.0 or later" ;
+    }
+
+    return $(result) ;
+}
+
 lib curl : : <name>curl : : <include>/usr/include <include>/usr/local/include ;
 
 lib dbghelp : : <name>dbghelp ;
@@ -786,9 +816,8 @@ SOURCES =
 	entry
 	error_code
 	http2_errors
-	aux_/tracker_http_client
-	aux_/curl_tracker_manager
 	aux_/curl_tracker_client
+	aux_/curl_thread_manager
 	file_storage
 	escape_string
 	string_util

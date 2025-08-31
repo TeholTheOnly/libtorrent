@@ -43,8 +43,10 @@ curl_tracker_connection::curl_tracker_connection(
 	io_context& ios
 	, tracker_manager& man
 	, tracker_request req
-	, std::weak_ptr<request_callback> c)
+	, std::weak_ptr<request_callback> c
+	, std::shared_ptr<aux::curl_thread_manager> curl_mgr)
 	: http_tracker_connection(ios, man, std::move(req), c)
+	, m_curl_thread_manager(std::move(curl_mgr))
 {
 	// Get the actual session settings and copy relevant tracker settings
 	aux::session_settings const& session_sett = m_man.settings();
@@ -92,7 +94,8 @@ curl_tracker_connection::curl_tracker_connection(
 	m_client = std::make_unique<aux::curl_tracker_client>(
 		ios,
 		tracker_req().url,
-		sett);
+		sett,
+		m_curl_thread_manager);
 }
 
 void curl_tracker_connection::start()

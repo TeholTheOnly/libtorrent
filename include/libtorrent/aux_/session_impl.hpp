@@ -62,6 +62,9 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/socket.hpp"
 #include "libtorrent/peer_id.hpp"
 #include "libtorrent/tracker_manager.hpp"
+#ifdef TORRENT_USE_LIBCURL
+#include "libtorrent/aux_/curl_thread_manager.hpp"
+#endif
 #include "libtorrent/debug.hpp"
 #include "libtorrent/piece_block_progress.hpp"
 #include "libtorrent/ip_filter.hpp"
@@ -965,6 +968,11 @@ namespace aux {
 			peer_class_t m_local_peer_class{0};
 
 			resolver m_host_resolver;
+
+#ifdef TORRENT_USE_LIBCURL
+			// shared curl thread manager for all tracker requests
+			std::shared_ptr<curl_thread_manager> m_curl_thread_manager;
+#endif
 
 			tracker_manager m_tracker_manager;
 

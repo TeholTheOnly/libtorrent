@@ -197,12 +197,18 @@ constexpr tracker_request_flags_t tracker_request::i2p;
 #if !defined TORRENT_DISABLE_LOGGING || TORRENT_USE_ASSERTS
 		, aux::session_logger& ses
 #endif
+#ifdef TORRENT_USE_LIBCURL
+		, std::shared_ptr<aux::curl_thread_manager> curl_mgr
+#endif
 		)
 		: m_send_fun(std::move(send_fun))
 		, m_send_fun_hostname(std::move(send_fun_hostname))
 		, m_host_resolver(resolver)
 		, m_settings(sett)
 		, m_stats_counters(stats_counters)
+#ifdef TORRENT_USE_LIBCURL
+		, m_curl_thread_manager(std::move(curl_mgr))
+#endif
 #if !defined TORRENT_DISABLE_LOGGING || TORRENT_USE_ASSERTS
 		, m_ses(ses)
 #endif
@@ -294,7 +300,7 @@ constexpr tracker_request_flags_t tracker_request::i2p;
 #endif
 		{
 #ifdef TORRENT_USE_LIBCURL
-			auto con = std::make_shared<curl_tracker_connection>(ios, *this, std::move(req), c);
+			auto con = std::make_shared<curl_tracker_connection>(ios, *this, std::move(req), c, m_curl_thread_manager);
 #else
 			auto con = std::make_shared<http_tracker_connection>(ios, *this, std::move(req), c);
 #endif

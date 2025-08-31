@@ -43,8 +43,12 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/sha1_hash.hpp"
 #include "libtorrent/aux_/vector.hpp"
 #include "libtorrent/aux_/path.hpp"
+#include "libtorrent/io_context.hpp"
 #include <vector>
 #include <fstream>
+#include <chrono>
+#include <functional>
+#include <thread>
 
 namespace libtorrent
 {
@@ -87,6 +91,28 @@ struct file_ent
 };
 
 EXPORT lt::file_storage make_files(std::vector<file_ent> files, int piece_size);
+
+// Helper function to run the io_context until a condition is met or a timeout occurs.
+// This is essential for tests with async callbacks posted from worker threads.
+template<typename Duration>
+inline bool run_io_context_until(lt::io_context& ios, Duration timeout, std::function<bool()> condition)
+{
+	using namespace std::chrono;
+	auto deadline = steady_clock::now() + timeout;
+	while (!condition() && steady_clock::now() < deadline)
+	{
+		// Restart the io_context in case it stopped
+		ios.restart();
+		
+		// Run the io_context for a short time to process handlers
+		// This is more reliable than poll() for ensuring all handlers get processed
+		ios.run_for(milliseconds(10));
+		
+		// Small delay to allow worker thread to post more handlers
+		std::this_thread::sleep_for(milliseconds(1));
+	}
+	return condition();
+}
 
 #endif
 

@@ -179,10 +179,13 @@ run test_ed25519.cpp ;
 run test_gzip.cpp ;
 run test_http2_errors.cpp ;
 run test_tracker_interface.cpp ;
-run test_curl_tracker_manager.cpp ;
+# Disabled - curl_tracker_manager was integrated into tracker_manager
+# run test_curl_tracker_manager.cpp ;
 run test_curl_tracker_client.cpp ;
 run test_curl_security.cpp ;
 run test_curl_integration.cpp ;
+run test_curl_thread_manager.cpp ;
+run test_idle_cpu_bug.cpp ;
 run test_receive_buffer.cpp ;
 run test_alert_manager.cpp ;
 run test_apply_pad.cpp ;

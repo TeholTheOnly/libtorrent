@@ -86,6 +86,9 @@ namespace aux {
 	struct session_logger;
 	struct session_settings;
 	struct resolver_interface;
+#ifdef TORRENT_USE_LIBCURL
+	class curl_thread_manager;
+#endif
 }
 
 using tracker_request_flags_t = flags::bitfield_flag<std::uint8_t, struct tracker_request_flags_tag>;
@@ -339,6 +342,9 @@ enum class event_t : std::uint8_t
 #if !defined TORRENT_DISABLE_LOGGING || TORRENT_USE_ASSERTS
 			, aux::session_logger& ses
 #endif
+#ifdef TORRENT_USE_LIBCURL
+			, std::shared_ptr<aux::curl_thread_manager> curl_mgr
+#endif
 			);
 
 		~tracker_manager();
@@ -406,6 +412,9 @@ enum class event_t : std::uint8_t
 		aux::resolver_interface& m_host_resolver;
 		aux::session_settings const& m_settings;
 		counters& m_stats_counters;
+#ifdef TORRENT_USE_LIBCURL
+		std::shared_ptr<aux::curl_thread_manager> m_curl_thread_manager;
+#endif
 		bool m_abort = false;
 #if !defined TORRENT_DISABLE_LOGGING || TORRENT_USE_ASSERTS
 		aux::session_logger& m_ses;

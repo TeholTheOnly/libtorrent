@@ -13,6 +13,9 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 chunked_encoding = False
 keepalive = True
 
+# Track retry attempts by client address for /retry_test
+retry_attempts = {}
+
 try:
     fin = open('test_file', 'rb')
     f = gzip.open('test_file.gz', 'wb')
@@ -89,6 +92,63 @@ class http_handler(BaseHTTPRequestHandler):
             self.send_header("Location", "../test_file")
             self.send_header("Connection", "close")
             self.end_headers()
+        elif self.path == '/status/500':
+            # Always return 500 Internal Server Error
+            self.send_response(500)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+        elif self.path == '/status/503':
+            # Always return 503 Service Unavailable
+            self.send_response(503)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+        elif self.path == '/status/404':
+            # Always return 404 Not Found
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+        elif self.path == '/retry_test':
+            # Return 500 on first attempt, 200 on retry
+            global retry_attempts
+            # Use a fixed key for this test since curl uses different ports for each connection
+            client_key = 'retry_test_client'
+            
+            if client_key not in retry_attempts:
+                retry_attempts[client_key] = 1
+                # First attempt - return 500
+                print(f'RETRY_TEST: First attempt from port {client_key}, returning 500')
+                sys.stdout.flush()
+                self.send_response(500)
+                self.send_header("Content-Length", "0")
+                self.send_header("Connection", "close")
+                self.end_headers()
+            else:
+                # Subsequent attempt - return 200
+                retry_attempts[client_key] += 1
+                print(f'RETRY_TEST: Retry #{retry_attempts[client_key]-1} from port {client_key}, returning 200')
+                sys.stdout.flush()
+                self.send_response(200)
+                response = b'Success after retry'
+                self.send_header("Content-Length", str(len(response)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(response)
+                # Clean up after successful retry
+                if retry_attempts[client_key] >= 2:
+                    del retry_attempts[client_key]
+        elif self.path == '/slow':
+            # Delay 5 seconds before responding (for timeout testing)
+            import time
+            time.sleep(5)
+            self.send_response(200)
+            response = b'Slow response'
+            self.send_header("Content-Length", str(len(response)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(response)
         elif self.path.startswith('/announce'):
             self.send_response(200)
             response = b'd8:intervali1800e8:completei1e10:incompletei1e' + \

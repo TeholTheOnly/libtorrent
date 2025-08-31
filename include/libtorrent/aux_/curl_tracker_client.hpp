@@ -37,8 +37,7 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #ifdef TORRENT_USE_LIBCURL
 
-#include "libtorrent/aux_/tracker_http_client.hpp"
-#include "libtorrent/aux_/curl_tracker_manager.hpp"
+#include "libtorrent/aux_/curl_thread_manager.hpp"
 #include "libtorrent/tracker_manager.hpp"
 #include "libtorrent/io_context.hpp"
 #include "libtorrent/settings_pack.hpp"
@@ -47,46 +46,48 @@ POSSIBILITY OF SUCH DAMAGE.
 
 namespace libtorrent { namespace aux {
 
+// Tracker response parsing functions (following http_tracker_connection pattern)
+TORRENT_EXTRA_EXPORT tracker_response parse_announce_response(
+	span<char const> data,
+	error_code& ec);
+
+TORRENT_EXTRA_EXPORT tracker_response parse_scrape_response(
+	span<char const> data,
+	error_code& ec);
+
 // Unified libcurl-based tracker client for HTTP/1.1 and HTTP/2
 // REPLACES: http_tracker_connection entirely
 // FIXES: Connection reuse, timeout handling, proxy support, HTTP parsing
 // ADDS: HTTP/2 support, multiplexing, proper keep-alive
-class TORRENT_EXPORT curl_tracker_client : public tracker_http_client {
+class TORRENT_EXPORT curl_tracker_client {
 public:
 	curl_tracker_client(
 		io_context& ios,
 		std::string const& url,
-		settings_pack const& settings);
+		settings_pack const& settings,
+		std::shared_ptr<curl_thread_manager> curl_mgr);
 	
-	~curl_tracker_client() override;
+	~curl_tracker_client();
 	
-	// Implement tracker_http_client interface
+	// Main tracker operations
 	void announce(
 		tracker_request const& req,
-		std::function<void(error_code const&, tracker_response const&)> handler) override;
+		std::function<void(error_code const&, tracker_response const&)> handler);
 	
 	void scrape(
 		tracker_request const& req,
-		std::function<void(error_code const&, tracker_response const&)> handler) override;
+		std::function<void(error_code const&, tracker_response const&)> handler);
 	
 	// libcurl handles connection pooling, always reusable
-	bool can_reuse() const override { return true; }
+	bool can_reuse() const { return true; }
 	
-	void close() override;
+	void close();
 	
 private:
 	// URL building helpers
 	std::string build_announce_url(tracker_request const& req) const;
 	std::string build_scrape_url(tracker_request const& req) const;
 	std::string build_tracker_query(tracker_request const& req, bool scrape = false) const;
-	
-	// Response parsing helpers  
-	tracker_response parse_announce_response(
-		std::vector<char> const& data,
-		error_code& ec) const;
-	tracker_response parse_scrape_response(
-		std::vector<char> const& data,
-		error_code& ec) const;
 	
 	// Convert scrape URL from announce URL
 	std::string scrape_url_from_announce(std::string const& announce) const;
@@ -95,10 +96,7 @@ private:
 	io_context& m_ios;
 	std::string m_tracker_url;
 	settings_pack m_settings;
-	std::shared_ptr<curl_tracker_manager> m_manager;
-	
-	// Track pending requests for cancellation
-	std::vector<CURL*> m_pending_requests;
+	std::shared_ptr<curl_thread_manager> m_curl_thread_manager;
 };
 
 }} // namespace libtorrent::aux

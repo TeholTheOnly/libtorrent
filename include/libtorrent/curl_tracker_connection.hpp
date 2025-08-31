@@ -43,6 +43,10 @@ POSSIBILITY OF SUCH DAMAGE.
 
 namespace libtorrent {
 
+namespace aux {
+	class curl_thread_manager;
+}
+
 // Wrapper class that adapts curl_tracker_client to the tracker_connection interface
 // This allows seamless integration with tracker_manager without major refactoring
 class TORRENT_EXTRA_EXPORT curl_tracker_connection
@@ -54,7 +58,8 @@ public:
 		io_context& ios
 		, tracker_manager& man
 		, tracker_request req
-		, std::weak_ptr<request_callback> c);
+		, std::weak_ptr<request_callback> c
+		, std::shared_ptr<aux::curl_thread_manager> curl_mgr);
 
 	void start() override;
 	void close() override;
@@ -71,6 +76,7 @@ private:
 	void on_response(error_code const& ec, tracker_response const& resp);
 
 	std::unique_ptr<aux::curl_tracker_client> m_client;
+	std::shared_ptr<aux::curl_thread_manager> m_curl_thread_manager;
 	bool m_started = false;
 };
 

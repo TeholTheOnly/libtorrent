@@ -89,11 +89,13 @@ namespace {
 		
 		return true;
 	}
+} // anonymous namespace
 
-	tracker_response parse_announce_response_impl(
-		span<char const> data,
-		error_code& ec)
-	{
+// Free function implementations (following http_tracker_connection pattern)
+tracker_response parse_announce_response(
+	span<char const> data,
+	error_code& ec)
+{
 		tracker_response resp;
 		
 		bdecode_node e;
@@ -179,31 +181,36 @@ namespace {
 		if (peers6_ent)
 		{
 			char const* peers = peers6_ent.string_ptr();
-			char const* peers_end = peers + peers6_ent.string_length();
 			int const len = peers6_ent.string_length();
 			
-			if (len % 18 != 0)
+			// Single definitive bounds check
+			if (len % 18 != 0 || len < 0)
 			{
-				ec = errors::invalid_tracker_response;
-				return resp;
+				// Invalid IPv6 peer data - must be multiple of 18 bytes
+				// Skip invalid data rather than failing entire response
+				// This is more robust for partially corrupt responses
 			}
-			
-			// Fixed bounds checking and pointer advancement
-			for (int i = 0; i + 18 <= len && peers + 18 <= peers_end; i += 18)
+			else if (len > 0)
 			{
-				// Ensure we have enough data before reading
-				if (peers + 18 > peers_end) break;
+				// Pre-allocate for efficiency
+				resp.peers.reserve(resp.peers.size() + len / 18);
 				
-				peer_entry p;
-				address_v6::bytes_type addr_bytes;
-				std::memcpy(addr_bytes.data(), peers, 16);
-				p.hostname = address_v6(addr_bytes).to_string();
-				peers += 16;  // Critical: Advance pointer after reading address
-				
-				p.port = read_uint16(peers);
-				peers += 2;   // Critical: Advance pointer after reading port
-				
-				resp.peers.push_back(std::move(p));
+				// Simple, safe iteration without redundant checks
+				for (int i = 0; i < len; i += 18)
+				{
+					peer_entry p;
+					address_v6::bytes_type addr_bytes;
+					std::memcpy(addr_bytes.data(), peers + i, 16);
+					p.hostname = address_v6(addr_bytes).to_string();
+					
+					// read_uint16 expects a mutable reference to advance the pointer
+					// Create a local pointer that won't affect our iteration
+					char const* port_ptr = peers + i + 16;
+					p.port = read_uint16(port_ptr);
+					// Note: port_ptr is now advanced by 2, but we don't use it again
+					
+					resp.peers.push_back(std::move(p));
+				}
 			}
 		}
 		
@@ -229,10 +236,10 @@ namespace {
 		return resp;
 	}
 
-	tracker_response parse_scrape_response_impl(
-		span<char const> data,
-		error_code& ec)
-	{
+tracker_response parse_scrape_response(
+	span<char const> data,
+	error_code& ec)
+{
 		tracker_response resp;
 		
 		bdecode_node e;
@@ -284,16 +291,15 @@ namespace {
 		return resp;
 	}
 
-} // anonymous namespace
-
 curl_tracker_client::curl_tracker_client(
 	io_context& ios,
 	std::string const& url,
-	settings_pack const& settings)
+	settings_pack const& settings,
+	std::shared_ptr<curl_thread_manager> curl_mgr)
 	: m_ios(ios)
 	, m_tracker_url(url)
 	, m_settings(settings)
-	, m_manager(std::make_shared<curl_tracker_manager>(ios, settings))
+	, m_curl_thread_manager(std::move(curl_mgr))
 {
 }
 
@@ -308,7 +314,7 @@ void curl_tracker_client::announce(
 {
 	std::string url = build_announce_url(req);
 	
-	auto handle = m_manager->add_request(url,
+	m_curl_thread_manager->add_request(url,
 		[this, handler](error_code const& ec, std::vector<char> const& data) {
 			if (ec) {
 				tracker_response resp;
@@ -318,13 +324,10 @@ void curl_tracker_client::announce(
 			}
 			
 			error_code parse_ec;
-			tracker_response resp = parse_announce_response(data, parse_ec);
+			tracker_response resp = parse_announce_response(
+				span<char const>(data.data(), data.size()), parse_ec);
 			handler(parse_ec, resp);
 		});
-		
-	if (handle) {
-		m_pending_requests.push_back(handle);
-	}
 }
 
 void curl_tracker_client::scrape(
@@ -333,7 +336,7 @@ void curl_tracker_client::scrape(
 {
 	std::string url = build_scrape_url(req);
 	
-	auto handle = m_manager->add_request(url,
+	m_curl_thread_manager->add_request(url,
 		[this, handler](error_code const& ec, std::vector<char> const& data) {
 			if (ec) {
 				tracker_response resp;
@@ -343,22 +346,16 @@ void curl_tracker_client::scrape(
 			}
 			
 			error_code parse_ec;
-			tracker_response resp = parse_scrape_response(data, parse_ec);
+			tracker_response resp = parse_scrape_response(
+				span<char const>(data.data(), data.size()), parse_ec);
 			handler(parse_ec, resp);
 		});
-		
-	if (handle) {
-		m_pending_requests.push_back(handle);
-	}
 }
 
 void curl_tracker_client::close()
 {
-	// Cancel all pending requests
-	for (auto handle : m_pending_requests) {
-		m_manager->cancel_request(handle);
-	}
-	m_pending_requests.clear();
+	// No longer tracking pending requests since we don't support cancellation
+	// The curl_thread_manager will handle cleanup on shutdown
 }
 
 std::string curl_tracker_client::build_announce_url(tracker_request const& req) const
@@ -397,9 +394,13 @@ std::string curl_tracker_client::build_tracker_query(tracker_request const& req,
 	// Add event if not none
 	if (req.event != event_t::none) {
 		// BEP-3 compliant events only (removed non-standard "paused")
-		const char* event_str[] = {"empty", "completed", "started", "stopped"};
-		query += "&event=";
-		query += event_str[static_cast<int>(req.event)];
+		// Only add event parameter for valid BEP-3 events (1=completed, 2=started, 3=stopped)
+		// Skip event_t::paused (4) as it's non-standard
+		if (static_cast<int>(req.event) >= 1 && static_cast<int>(req.event) <= 3) {
+			const char* event_str[] = {"empty", "completed", "started", "stopped"};
+			query += "&event=";
+			query += event_str[static_cast<int>(req.event)];
+		}
 	}
 	
 	// Add compact and no_peer_id for efficiency (BEP-23 and BEP-3)
@@ -431,21 +432,6 @@ std::string curl_tracker_client::build_tracker_query(tracker_request const& req,
 	return query;
 }
 
-tracker_response curl_tracker_client::parse_announce_response(
-	std::vector<char> const& data,
-	error_code& ec) const
-{
-	return parse_announce_response_impl(
-		span<char const>(data.data(), data.size()), ec);
-}
-
-tracker_response curl_tracker_client::parse_scrape_response(
-	std::vector<char> const& data,
-	error_code& ec) const
-{
-	return parse_scrape_response_impl(
-		span<char const>(data.data(), data.size()), ec);
-}
 
 std::string curl_tracker_client::scrape_url_from_announce(std::string const& announce) const
 {
