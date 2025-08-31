@@ -75,6 +75,9 @@ namespace libtorrent {
 	struct timeout_handler;
 	class udp_tracker_connection;
 	class http_tracker_connection;
+#ifdef TORRENT_USE_LIBCURL
+	class curl_tracker_connection;
+#endif
 	struct counters;
 #if TORRENT_USE_I2P
 	class i2p_connection;

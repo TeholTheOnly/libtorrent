@@ -240,6 +240,9 @@ constexpr int DISK_WRITE_MODE = settings_pack::enable_os_cache;
 		SET(enable_set_file_valid_data, false, nullptr),
 		SET(socks5_udp_send_local_ep, false, nullptr),
 		SET(proxy_send_host_in_connect, false, nullptr),
+		SET(enable_http2_trackers, true, nullptr),
+		SET(tracker_ssl_verify_peer, true, nullptr),
+		SET(tracker_ssl_verify_host, true, nullptr),
 	}});
 
 	CONSTEXPR_SETTINGS
@@ -405,7 +408,16 @@ constexpr int DISK_WRITE_MODE = settings_pack::enable_os_cache;
 		SET(i2p_outbound_length, 3, nullptr),
 		SET(announce_port, 0, nullptr),
 		SET(i2p_inbound_length_variance, 0, nullptr),
-		SET(i2p_outbound_length_variance, 0, nullptr)
+		SET(i2p_outbound_length_variance, 0, nullptr),
+		SET(http2_max_pool_size, 100, nullptr),
+		SET(http2_max_connections_per_host, 2, nullptr),
+		SET(http2_max_pending_operations, 1000, nullptr),
+		SET(http2_idle_timeout, 60, nullptr),
+		SET(http2_max_concurrent_streams, 100, nullptr),
+		SET(http2_protocol_cache_success_ttl, 168, nullptr),
+		SET(http2_protocol_cache_failure_ttl, 24, nullptr),
+		SET(tracker_max_response_size, 10485760, nullptr),
+		SET(tracker_min_tls_version, 2, nullptr)
 	}});
 
 #undef SET

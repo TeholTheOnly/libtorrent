@@ -37,6 +37,9 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include "libtorrent/tracker_manager.hpp"
 #include "libtorrent/http_tracker_connection.hpp"
+#ifdef TORRENT_USE_LIBCURL
+#include "libtorrent/curl_tracker_connection.hpp"
+#endif
 #include "libtorrent/udp_tracker_connection.hpp"
 #include "libtorrent/aux_/io.hpp"
 #include "libtorrent/aux_/session_interface.hpp"
@@ -290,7 +293,11 @@ constexpr tracker_request_flags_t tracker_request::i2p;
 		if (protocol == "http")
 #endif
 		{
+#ifdef TORRENT_USE_LIBCURL
+			auto con = std::make_shared<curl_tracker_connection>(ios, *this, std::move(req), c);
+#else
 			auto con = std::make_shared<http_tracker_connection>(ios, *this, std::move(req), c);
+#endif
 			if (m_http_conns.size() < std::size_t(sett.get_int(settings_pack::max_concurrent_http_announces)))
 			{
 				m_http_conns.push_back(std::move(con));

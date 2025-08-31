@@ -1026,6 +1026,22 @@ namespace aux {
 			// man-in-the-middle connections.
 			proxy_send_host_in_connect,
 
+			// if true, tracker connections will attempt to use HTTP/2
+			// when available (requires libcurl with HTTP/2 support).
+			// HTTP/2 provides multiplexing and connection reuse for
+			// improved performance with many torrents.
+			enable_http2_trackers,
+
+			// if true, tracker connections will verify the SSL certificate
+			// presented by the tracker. This should be enabled for security.
+			// Default: true
+			tracker_ssl_verify_peer,
+
+			// if true, tracker connections will verify that the SSL certificate
+			// hostname matches the tracker hostname. This should be enabled
+			// for security. Default: true
+			tracker_ssl_verify_host,
+
 			max_bool_setting_internal
 		};
 
@@ -2099,6 +2115,34 @@ namespace aux {
 			// Configures the variance for I2P inbound and outbound tunnel lengths [-7..7]
 			i2p_inbound_length_variance,
 			i2p_outbound_length_variance,
+
+			// HTTP/2 tracker connection pool settings
+			// Maximum number of HTTP/2 connections in the pool
+			http2_max_pool_size,
+			// Maximum number of HTTP/2 connections per host
+			http2_max_connections_per_host,
+			// Maximum number of pending connection operations
+			http2_max_pending_operations,
+			// Idle timeout for HTTP/2 connections (seconds)
+			http2_idle_timeout,
+			// Maximum concurrent streams per HTTP/2 connection
+			http2_max_concurrent_streams,
+			// HTTP/2 protocol cache TTL for successful negotiation (hours)
+			// Default: 168 hours (7 days)
+			http2_protocol_cache_success_ttl,
+			// HTTP/2 protocol cache TTL for failed negotiation (hours)
+			// Default: 24 hours (1 day)
+			http2_protocol_cache_failure_ttl,
+
+			// Maximum size in bytes for tracker HTTP responses.
+			// Responses larger than this will be rejected.
+			// Default: 10485760 (10 MB)
+			tracker_max_response_size,
+
+			// Minimum TLS version for tracker HTTPS connections.
+			// 0 = TLS 1.0, 1 = TLS 1.1, 2 = TLS 1.2, 3 = TLS 1.3
+			// Default: 2 (TLS 1.2)
+			tracker_min_tls_version,
 
 			max_int_setting_internal
 		};

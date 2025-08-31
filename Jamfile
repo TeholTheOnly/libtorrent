@@ -221,6 +221,10 @@ rule linking ( properties * )
 		result += <library>boost_system ;
 	}
 
+	# Add libcurl for HTTP/2 tracker support
+	result += <library>curl ;
+	result += <define>TORRENT_USE_LIBCURL ;
+
 	if ! <target-os>windows in $(properties)
 	{
 		# MingW defines a macro called "stat" if this is set, which causes build
@@ -730,6 +734,9 @@ lib gnutls : : <name>gnutls <conditional>@gnutls-lib-path : :
 lib wolfssl : : <name>wolfssl <conditional>@wolfssl-lib-path : :
 	<conditional>@wolfssl-include-path ;
 
+# libcurl for HTTP/2 tracker support
+lib curl : : <name>curl : : <include>/usr/include <include>/usr/local/include ;
+
 lib dbghelp : : <name>dbghelp ;
 
 # required for networking on beos
@@ -778,6 +785,10 @@ SOURCES =
 	drive_info
 	entry
 	error_code
+	http2_errors
+	aux_/tracker_http_client
+	aux_/curl_tracker_manager
+	aux_/curl_tracker_client
 	file_storage
 	escape_string
 	string_util
@@ -841,6 +852,7 @@ SOURCES =
 	time
 	tracker_manager
 	http_tracker_connection
+	curl_tracker_connection
 	udp_tracker_connection
 	timestamp_history
 	udp_socket
@@ -978,6 +990,7 @@ lib torrent
 	: # usage requirements
 	$(usage-requirements)
 	<link>shared:<define>TORRENT_LINKING_SHARED
+	<define>TORRENT_USE_LIBCURL
 
 	;
 
