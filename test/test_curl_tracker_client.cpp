@@ -36,24 +36,26 @@ POSSIBILITY OF SUCH DAMAGE.
 #ifdef TORRENT_USE_LIBCURL
 
 #include "libtorrent/aux_/curl_tracker_client.hpp"
-#include "libtorrent/aux_/curl_tracker_manager.hpp"
+#include "libtorrent/aux_/curl_thread_manager.hpp"
+#include "libtorrent/aux_/session_settings.hpp"
 #include "libtorrent/io_context.hpp"
 #include "libtorrent/settings_pack.hpp"
 #include "libtorrent/tracker_manager.hpp"
 #include "libtorrent/bdecode.hpp"
 #include "libtorrent/bencode.hpp"
 #include "libtorrent/sha1_hash.hpp"
+#include "setup_transfer.hpp"
 #include <curl/curl.h>
 #include <signal.h>
 #include <future>
 #include <vector>
 #include <chrono>
+#include <sstream>
 
 using namespace libtorrent;
 using namespace libtorrent::aux;
 using namespace std::chrono_literals;
 
-// Global initialization for curl
 namespace {
 	struct curl_initializer {
 		curl_initializer() {
@@ -63,28 +65,37 @@ namespace {
 	} g_curl_init;
 }
 
-// Test 1: Basic client creation
 TORRENT_TEST(curl_tracker_client_creation)
 {
+	int const port = start_web_server(false);
+	
 	io_context ios;
 	settings_pack settings;
+	session_settings sett(settings);
+	auto curl_mgr = curl_thread_manager::create(ios, sett);
 	
-	std::string tracker_url = "http://tracker.example.com:8080/announce";
-	auto client = std::make_unique<curl_tracker_client>(ios, tracker_url, settings);
+	std::stringstream tracker_url;
+	tracker_url << "http://127.0.0.1:" << port << "/announce";
+	auto client = std::make_unique<curl_tracker_client>(ios, tracker_url.str(), settings, curl_mgr);
 	
 	TEST_CHECK(client != nullptr);
-	// Client should always be reusable with libcurl pooling
 	TEST_CHECK(client->can_reuse());
+	
+	stop_web_server();
 }
 
-// Test 2: Announce request URL building
 TORRENT_TEST(curl_tracker_client_announce_url)
 {
+	int const port = start_web_server(false);
+	
 	io_context ios;
 	settings_pack settings;
+	session_settings sett(settings);
+	auto curl_mgr = curl_thread_manager::create(ios, sett);
 	
-	std::string tracker_url = "http://tracker.example.com/announce";
-	auto client = std::make_unique<curl_tracker_client>(ios, tracker_url, settings);
+	std::stringstream tracker_url;
+	tracker_url << "http://127.0.0.1:" << port << "/announce";
+	auto client = std::make_unique<curl_tracker_client>(ios, tracker_url.str(), settings, curl_mgr);
 	
 	tracker_request req;
 	req.info_hash = sha1_hash("01234567890123456789");
@@ -99,31 +110,32 @@ TORRENT_TEST(curl_tracker_client_announce_url)
 	req.key = 12345;
 	req.num_want = 50;
 	
-	// The URL should contain all required parameters
-	// We'll verify this by checking the response has the right format
 	std::promise<bool> url_valid;
 	auto future = url_valid.get_future();
 	
-	// For now, just test that announce doesn't crash
 	client->announce(req, [&url_valid](error_code const& /*ec*/, tracker_response const& /*resp*/) {
-		// Will fail to connect, but URL building should work
 		url_valid.set_value(true);
 	});
 	
 	ios.run_for(1s);
 	
-	TEST_CHECK(true); // If we get here, URL building didn't crash
+	TEST_CHECK(true);
+	
+	stop_web_server();
 }
 
-// Test 3: Scrape URL building
 TORRENT_TEST(curl_tracker_client_scrape_url)
 {
+	int const port = start_web_server(false);
+	
 	io_context ios;
 	settings_pack settings;
 	
-	// Standard announce URL should be converted to scrape
-	std::string tracker_url = "http://tracker.example.com/announce";
-	auto client = std::make_unique<curl_tracker_client>(ios, tracker_url, settings);
+	std::stringstream tracker_url;
+	tracker_url << "http://127.0.0.1:" << port << "/announce";
+	session_settings sett(settings);
+	auto curl_mgr = curl_thread_manager::create(ios, sett);
+	auto client = std::make_unique<curl_tracker_client>(ios, tracker_url.str(), settings, curl_mgr);
 	
 	tracker_request req;
 	req.info_hash = sha1_hash("01234567890123456789");
@@ -137,19 +149,18 @@ TORRENT_TEST(curl_tracker_client_scrape_url)
 	
 	ios.run_for(1s);
 	
-	TEST_CHECK(true); // URL conversion worked if we get here
+	TEST_CHECK(true);
+	
+	stop_web_server();
 }
 
-// Test 4: Parse valid announce response
 TORRENT_TEST(curl_tracker_client_parse_announce)
 {
-	// Create a mock bencode announce response
 	entry announce_resp;
 	announce_resp["interval"] = 1800;
 	announce_resp["complete"] = 10;
 	announce_resp["incomplete"] = 5;
 	
-	// Add peer list
 	entry::list_type& peers_list = announce_resp["peers"].list();
 	entry peer1;
 	peer1["ip"] = "192.168.1.1";
@@ -157,12 +168,9 @@ TORRENT_TEST(curl_tracker_client_parse_announce)
 	peer1["peer id"] = "ABCDEFGHIJKLMNOPQRST";
 	peers_list.push_back(peer1);
 	
-	// Encode to bencode
 	std::vector<char> buffer;
 	bencode(std::back_inserter(buffer), announce_resp);
 	
-	// This tests the parsing logic which will be in the implementation
-	// For now, just verify bencode structure
 	error_code ec;
 	bdecode_node node;
 	bdecode(buffer.data(), buffer.data() + buffer.size(), node, ec);
@@ -173,10 +181,8 @@ TORRENT_TEST(curl_tracker_client_parse_announce)
 	TEST_EQUAL(node.dict_find_int_value("incomplete"), 5);
 }
 
-// Test 5: Parse tracker error response
 TORRENT_TEST(curl_tracker_client_parse_error)
 {
-	// Create error response
 	entry error_resp;
 	error_resp["failure reason"] = "Torrent not registered";
 	
@@ -191,14 +197,11 @@ TORRENT_TEST(curl_tracker_client_parse_error)
 	TEST_CHECK(node.dict_find_string_value("failure reason") == "Torrent not registered");
 }
 
-// Test 6: Parse scrape response
 TORRENT_TEST(curl_tracker_client_parse_scrape)
 {
-	// Create mock scrape response
 	entry scrape_resp;
 	entry& files = scrape_resp["files"];
 	
-	// Add info for one torrent
 	std::string info_hash(20, '1');
 	entry& file_info = files[info_hash];
 	file_info["complete"] = 15;
@@ -216,22 +219,21 @@ TORRENT_TEST(curl_tracker_client_parse_scrape)
 	TEST_CHECK(node.dict_find("files"));
 }
 
-// Test 7: Connection reuse
 TORRENT_TEST(curl_tracker_client_connection_reuse)
 {
 	io_context ios;
 	settings_pack settings;
 	
 	std::string tracker_url = "http://tracker.example.com/announce";
-	auto client = std::make_unique<curl_tracker_client>(ios, tracker_url, settings);
+	session_settings sett(settings);
+	auto curl_mgr = curl_thread_manager::create(ios, sett);
+	auto client = std::make_unique<curl_tracker_client>(ios, tracker_url, settings, curl_mgr);
 	
-	// Should always be reusable with libcurl
 	TEST_CHECK(client->can_reuse());
 	
 	tracker_request req;
 	req.info_hash = sha1_hash("01234567890123456789");
 	
-	// Make multiple requests - should reuse connection
 	int requests_made = 0;
 	for (int i = 0; i < 3; ++i) {
 		client->announce(req, [&requests_made](error_code const& /*ec*/, tracker_response const& /*resp*/) {
@@ -239,14 +241,11 @@ TORRENT_TEST(curl_tracker_client_connection_reuse)
 		});
 	}
 	
-	// Should still be reusable
 	TEST_CHECK(client->can_reuse());
 	
-	// Close should work without issues
 	client->close();
 }
 
-// Test 8: HTTP/2 support verification
 TORRENT_TEST(curl_tracker_client_http2)
 {
 	io_context ios;
@@ -254,16 +253,15 @@ TORRENT_TEST(curl_tracker_client_http2)
 	// TODO: Add enable_http2_trackers setting
 	// settings.set_bool(settings_pack::enable_http2_trackers, true);
 	
-	// HTTPS URL should attempt HTTP/2 with ALPN
 	std::string tracker_url = "https://tracker.example.com/announce";
-	auto client = std::make_unique<curl_tracker_client>(ios, tracker_url, settings);
+	session_settings sett(settings);
+	auto curl_mgr = curl_thread_manager::create(ios, sett);
+	auto client = std::make_unique<curl_tracker_client>(ios, tracker_url, settings, curl_mgr);
 	
 	TEST_CHECK(client != nullptr);
-	// Verify client was created successfully
 	TEST_CHECK(client->can_reuse());
 }
 
-// Test 9: Timeout handling
 TORRENT_TEST(curl_tracker_client_timeout)
 {
 	io_context ios;
@@ -271,9 +269,10 @@ TORRENT_TEST(curl_tracker_client_timeout)
 	settings.set_int(settings_pack::tracker_completion_timeout, 1);
 	settings.set_int(settings_pack::tracker_receive_timeout, 1);
 	
-	// Non-routable address should timeout
 	std::string tracker_url = "http://10.255.255.255/announce";
-	auto client = std::make_unique<curl_tracker_client>(ios, tracker_url, settings);
+	session_settings sett(settings);
+	auto curl_mgr = curl_thread_manager::create(ios, sett);
+	auto client = std::make_unique<curl_tracker_client>(ios, tracker_url, settings, curl_mgr);
 	
 	tracker_request req;
 	req.info_hash = sha1_hash("01234567890123456789");
@@ -293,18 +292,18 @@ TORRENT_TEST(curl_tracker_client_timeout)
 		auto ec = future.get();
 		auto duration = std::chrono::steady_clock::now() - start;
 		
-		TEST_CHECK(ec); // Should have error
-		TEST_CHECK(duration < 2s); // Should timeout quickly
+		TEST_CHECK(ec);
+		TEST_CHECK(duration < 2s);
 	}
 }
 
-// Test 10: Invalid URL handling
 TORRENT_TEST(curl_tracker_client_invalid_url)
 {
 	io_context ios;
 	settings_pack settings;
+	session_settings sett(settings);
+	auto curl_mgr = curl_thread_manager::create(ios, sett);
 	
-	// Various invalid URLs
 	std::vector<std::string> invalid_urls = {
 		"not-a-url",
 		"http://",
@@ -313,15 +312,13 @@ TORRENT_TEST(curl_tracker_client_invalid_url)
 	};
 	
 	for (auto const& url : invalid_urls) {
-		// Should handle gracefully without crashing
-		auto client = std::make_unique<curl_tracker_client>(ios, url, settings);
+		auto client = std::make_unique<curl_tracker_client>(ios, url, settings, curl_mgr);
 		TEST_CHECK(client != nullptr);
 		
 		tracker_request req;
 		req.info_hash = sha1_hash("01234567890123456789");
 		
 		client->announce(req, [](error_code const& ec, tracker_response const& /*resp*/) {
-			// Expect error
 			TEST_CHECK(ec);
 		});
 	}
@@ -329,15 +326,15 @@ TORRENT_TEST(curl_tracker_client_invalid_url)
 	ios.run_for(1s);
 }
 
-// Test 11: IPv6 peer parsing fuzzing - security hardening
 TORRENT_TEST(curl_tracker_client_ipv6_parsing_fuzzing)
 {
 	io_context ios;
 	settings_pack settings;
 	std::string tracker_url = "http://tracker.example.com/announce";
-	auto client = std::make_unique<curl_tracker_client>(ios, tracker_url, settings);
+	session_settings sett(settings);
+	auto curl_mgr = curl_thread_manager::create(ios, sett);
+	auto client = std::make_unique<curl_tracker_client>(ios, tracker_url, settings, curl_mgr);
 	
-	// Test 1: Empty input
 	{
 		entry resp;
 		resp["peers6"] = std::string("");
@@ -348,13 +345,12 @@ TORRENT_TEST(curl_tracker_client_ipv6_parsing_fuzzing)
 		error_code ec;
 		tracker_response parsed = aux::parse_announce_response(
 			span<char const>(buffer.data(), buffer.size()), ec);
-		TEST_CHECK(parsed.peers.empty()); // Should handle empty gracefully
+		TEST_CHECK(parsed.peers.empty());
 	}
 	
-	// Test 2: Length not multiple of 18
 	{
 		entry resp;
-		resp["peers6"] = std::string(17, 'x'); // 17 bytes - invalid
+		resp["peers6"] = std::string(17, 'x'); // invalid length
 		
 		std::vector<char> buffer;
 		bencode(std::back_inserter(buffer), resp);
@@ -362,16 +358,14 @@ TORRENT_TEST(curl_tracker_client_ipv6_parsing_fuzzing)
 		error_code ec;
 		tracker_response parsed = aux::parse_announce_response(
 			span<char const>(buffer.data(), buffer.size()), ec);
-		TEST_CHECK(parsed.peers.empty()); // Should reject invalid length
+		TEST_CHECK(parsed.peers.empty());
 	}
 	
-	// Test 3: Valid single IPv6 peer (18 bytes)
 	{
 		entry resp;
 		std::string peer_data(18, '\0');
-		// Set some recognizable bytes
 		peer_data[0] = 0x20; peer_data[1] = 0x01; // IPv6 prefix
-		peer_data[16] = 0x1A; peer_data[17] = 0xE1; // Port 6881
+		peer_data[16] = 0x1A; peer_data[17] = static_cast<char>(0xE1); // Port 6881
 		resp["peers6"] = peer_data;
 		
 		std::vector<char> buffer;
@@ -387,16 +381,15 @@ TORRENT_TEST(curl_tracker_client_ipv6_parsing_fuzzing)
 		}
 	}
 	
-	// Test 4: Multiple valid IPv6 peers
 	{
 		entry resp;
-		std::string peer_data(18 * 3, '\0'); // 3 peers
+		std::string peer_data(18 * 3, '\0');
 		for (int i = 0; i < 3; ++i) {
 			int offset = i * 18;
 			peer_data[offset] = 0x20;
 			peer_data[offset + 1] = 0x01;
 			peer_data[offset + 16] = 0x1A;
-			peer_data[offset + 17] = 0xE1 + i; // Different ports
+			peer_data[offset + 17] = 0xE1 + i;
 		}
 		resp["peers6"] = peer_data;
 		
@@ -410,10 +403,8 @@ TORRENT_TEST(curl_tracker_client_ipv6_parsing_fuzzing)
 		TEST_EQUAL(parsed.peers.size(), 3);
 	}
 	
-	// Test 5: Extremely large input (memory exhaustion test)
 	{
 		entry resp;
-		// 1000 peers = 18000 bytes - should handle gracefully
 		std::string peer_data(18 * 1000, '\x01');
 		resp["peers6"] = peer_data;
 		
@@ -423,20 +414,18 @@ TORRENT_TEST(curl_tracker_client_ipv6_parsing_fuzzing)
 		error_code ec;
 		tracker_response parsed = aux::parse_announce_response(
 			span<char const>(buffer.data(), buffer.size()), ec);
-		TEST_CHECK(!ec); // Should handle large inputs
+		TEST_CHECK(!ec);
 		TEST_EQUAL(parsed.peers.size(), 1000);
 	}
 	
-	// Test 6: Mixed with IPv4 peers
 	{
 		entry resp;
-		// Add both IPv4 and IPv6 peers
 		std::string ipv4_data(6 * 2, '\0'); // 2 IPv4 peers
-		ipv4_data[4] = 0x1A; ipv4_data[5] = 0xE1; // Port
-		ipv4_data[10] = 0x1A; ipv4_data[11] = 0xE2;
+		ipv4_data[4] = 0x1A; ipv4_data[5] = static_cast<char>(0xE1); // Port
+		ipv4_data[10] = 0x1A; ipv4_data[11] = static_cast<char>(0xE2);
 		resp["peers"] = ipv4_data;
 		
-		std::string ipv6_data(18 * 2, '\0'); // 2 IPv6 peers
+		std::string ipv6_data(18 * 2, '\0');
 		resp["peers6"] = ipv6_data;
 		
 		std::vector<char> buffer;
@@ -446,16 +435,15 @@ TORRENT_TEST(curl_tracker_client_ipv6_parsing_fuzzing)
 		tracker_response parsed = aux::parse_announce_response(
 			span<char const>(buffer.data(), buffer.size()), ec);
 		TEST_CHECK(!ec);
-		TEST_EQUAL(parsed.peers.size(), 4); // 2 IPv4 + 2 IPv6
+		TEST_EQUAL(parsed.peers.size(), 4);
 	}
 }
 
 #else // TORRENT_USE_LIBCURL
 
-// If libcurl is not available, provide a dummy test
 TORRENT_TEST(curl_tracker_client_not_available)
 {
-	TEST_CHECK(true); // Pass - libcurl not configured
+	TEST_CHECK(true);
 }
 
 #endif // TORRENT_USE_LIBCURL

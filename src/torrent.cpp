@@ -68,6 +68,9 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/torrent.hpp"
 #include "libtorrent/torrent_handle.hpp"
 #include "libtorrent/announce_entry.hpp"
+#ifdef TORRENT_USE_LIBCURL
+#include "libtorrent/aux_/curl_thread_manager.hpp"
+#endif
 #include "libtorrent/torrent_info.hpp"
 #include "libtorrent/tracker_manager.hpp"
 #include "libtorrent/parse_url.hpp"
@@ -324,7 +327,14 @@ bool is_downloading_state(int const st)
 		{
 			m_trackers.clear();
 			for (auto const& ae : m_torrent_file->trackers())
+			{
 				m_trackers.emplace_back(ae);
+#ifdef TORRENT_USE_LIBCURL
+				// Notify curl_thread_manager of new tracker
+				if (auto* curl_mgr = m_ses.get_curl_thread_manager())
+					curl_mgr->tracker_added(ae.url);
+#endif
+			}
 		}
 
 		int tier = 0;
@@ -342,6 +352,11 @@ bool is_downloading_state(int const st)
 			{
 				if (e.url.empty()) continue;
 				m_trackers.push_back(e);
+#ifdef TORRENT_USE_LIBCURL
+				// Notify curl_thread_manager of new tracker
+				if (auto* curl_mgr = m_ses.get_curl_thread_manager())
+					curl_mgr->tracker_added(e.url);
+#endif
 				// add the tracker to the m_torrent_file here so that the trackers
 				// will be preserved via create_torrent() when passing in just the
 				// torrent_info object.
@@ -714,6 +729,15 @@ bool is_downloading_state(int const st)
 	{
 		// TODO: 3 assert there are no outstanding async operations on this
 		// torrent
+
+#ifdef TORRENT_USE_LIBCURL
+		// Notify curl_thread_manager of removed trackers
+		if (auto* curl_mgr = m_ses.get_curl_thread_manager())
+		{
+			for (auto const& ae : m_trackers)
+				curl_mgr->tracker_removed(ae.url);
+		}
+#endif
 
 #if TORRENT_USE_ASSERTS
 		for (torrent_list_index_t i{}; i != m_links.end_index(); ++i)
@@ -5887,11 +5911,25 @@ namespace {
 
 	void torrent::replace_trackers(std::vector<announce_entry> const& urls)
 	{
+#ifdef TORRENT_USE_LIBCURL
+		// Notify curl_thread_manager of removed trackers
+		if (auto* curl_mgr = m_ses.get_curl_thread_manager())
+		{
+			for (auto const& ae : m_trackers)
+				curl_mgr->tracker_removed(ae.url);
+		}
+#endif
+		
 		m_trackers.clear();
 		for (auto const& t : urls)
 		{
 			if (t.url.empty()) continue;
 			m_trackers.emplace_back(t);
+#ifdef TORRENT_USE_LIBCURL
+			// Notify curl_thread_manager of new tracker
+			if (auto* curl_mgr = m_ses.get_curl_thread_manager())
+				curl_mgr->tracker_added(t.url);
+#endif
 		}
 
 		// make sure the trackers are correctly ordered by tier
@@ -5957,6 +5995,13 @@ namespace {
 		k->tier = url.tier;
 		k->fail_limit = url.fail_limit;
 		set_need_save_resume(torrent_handle::if_metadata_changed);
+		
+#ifdef TORRENT_USE_LIBCURL
+		// Notify curl_thread_manager of new tracker
+		if (auto* curl_mgr = m_ses.get_curl_thread_manager())
+			curl_mgr->tracker_added(url.url);
+#endif
+		
 		if (m_announcing && !m_trackers.empty()) announce_with_tracker();
 		return true;
 	}

@@ -35,21 +35,27 @@ POSSIBILITY OF SUCH DAMAGE.
 #ifdef TORRENT_USE_LIBCURL
 
 #include "libtorrent/aux_/curl_thread_manager.hpp"
-#include "libtorrent/aux_/curl_handle_wrappers.hpp"  // RAII wrappers
+#include "libtorrent/aux_/curl_handle_wrappers.hpp"
 #include "libtorrent/assert.hpp"
 #include "libtorrent/error.hpp"
 #include "libtorrent/settings_pack.hpp"
+#include "libtorrent/parse_url.hpp"
 #include <boost/asio/post.hpp>
 #include <curl/curl.h>
 #include <chrono>
 #include <algorithm>
-#include <stdexcept> // For std::runtime_error
-#include <limits>    // For std::numeric_limits
-#include <thread>    // For std::this_thread::sleep_for
+#include <stdexcept>
+#include <limits>
+#include <thread>
+
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <sys/resource.h>
+#endif
 
 namespace libtorrent { namespace aux {
 
-// Define static constexpr member (required for C++14)
 constexpr std::chrono::milliseconds curl_thread_manager::WAKEUP_DELAY;
 
 // Structure to hold request data with proper lifetime management
@@ -57,21 +63,92 @@ constexpr std::chrono::milliseconds curl_thread_manager::WAKEUP_DELAY;
 // the response buffer stays alive throughout the transfer
 struct curl_transfer_data {
     curl_request request;
-    std::shared_ptr<response_data> response; // Keeps buffer alive
-    curl_easy_handle easy_handle; // RAII wrapper for CURL handle
+    std::shared_ptr<response_data> response;
+    curl_easy_handle easy_handle;
+
+    // SAFETY: Store strings that libcurl may reference after curl_easy_setopt
+    // These must outlive the curl handle's lifetime
+    std::string url_storage;
+    std::string user_agent_storage;
+    std::string proxy_hostname_storage;
+    std::string proxy_username_storage;
+    std::string proxy_password_storage;
+    std::string interface_storage;
 
     explicit curl_transfer_data(curl_request&& req)
         : request(std::move(req))
-        , response(request.response) // Share ownership
-        , easy_handle() // Initialize CURL handle (throws on failure)
+        , response(request.response)
+        , easy_handle()
+        , url_storage(request.url)
     {}
+
+    ~curl_transfer_data() {
+        // SECURITY: Clear sensitive data from memory using secure_clear pattern
+        // This prevents the data from being recovered from freed memory
+        if (!proxy_password_storage.empty()) {
+            std::fill(proxy_password_storage.begin(), proxy_password_storage.end(), '\0');
+            proxy_password_storage.clear();
+        }
+        if (!proxy_username_storage.empty()) {
+            std::fill(proxy_username_storage.begin(), proxy_username_storage.end(), '\0');
+            proxy_username_storage.clear();
+        }
+    }
+
+    // Disable copy to prevent accidental credential duplication
+    curl_transfer_data(const curl_transfer_data&) = delete;
+    curl_transfer_data& operator=(const curl_transfer_data&) = delete;
+
+    // Move is OK as it transfers ownership
+    curl_transfer_data(curl_transfer_data&&) = default;
+    curl_transfer_data& operator=(curl_transfer_data&&) = default;
 };
 
+void tracker_host_counter::add_tracker(const std::string& url) {
+    error_code ec;
+    auto components = parse_url_components(url, ec);
+    std::string host = std::get<2>(components);
+    if (ec || host.empty()) return;
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_tracker_ref_counts[host]++;
+}
+
+void tracker_host_counter::remove_tracker(const std::string& url) {
+    error_code ec;
+    auto components = parse_url_components(url, ec);
+    std::string host = std::get<2>(components);
+    if (ec || host.empty()) return;
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto it = m_tracker_ref_counts.find(host);
+    if (it != m_tracker_ref_counts.end()) {
+        if (--it->second == 0) {
+            m_tracker_ref_counts.erase(it);
+        }
+    }
+}
+
+void curl_thread_manager::tracker_added(const std::string& url) {
+    m_tracker_counter.add_tracker(url);
+    long new_limit = calculate_optimal_connections();
+    m_new_connection_limit.store(new_limit);
+    m_pool_needs_update.store(true);
+    wakeup_curl_thread();
+}
+
+void curl_thread_manager::tracker_removed(const std::string& url) {
+    m_tracker_counter.remove_tracker(url);
+    long new_limit = calculate_optimal_connections();
+    m_new_connection_limit.store(new_limit);
+    m_pool_needs_update.store(true);
+    wakeup_curl_thread();
+}
+
 namespace {
-    // Updated write callback for curl using response_data structure
+
     size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdata) noexcept {
         try {
-            // Cast userdata to response_data structure (which is heap-allocated)
             auto* data = static_cast<response_data*>(userdata);
             if (!data) return 0;
 
@@ -80,17 +157,33 @@ namespace {
 
             // Check against dynamic size limit
             if (buffer->size() + total > data->max_size) {
-                return 0; // Signal error to curl (CURLE_WRITE_ERROR)
+                return 0;
+            }
+
+            // SAFETY: Pre-reserve space to minimize allocation failure risk
+            size_t new_size = buffer->size() + total;
+
+            // Explicit try-catch for reserve() to handle std::bad_alloc
+            try {
+                if (buffer->capacity() < new_size) {
+                    buffer->reserve(new_size);
+                }
+            } catch (const std::bad_alloc&) {
+                return 0;
             }
 
             buffer->insert(buffer->end(), ptr, ptr + total);
             return total;
+
+        } catch (const std::bad_alloc&) {
+            return 0;
         } catch (...) {
+            // CRITICAL: Catch ALL exceptions to maintain noexcept guarantee
+            // Without this, std::terminate would be called
             return 0;
         }
     }
 
-    // Map curl errors to libtorrent errors
     error_code curl_error_to_libtorrent(CURLcode code) {
         switch(code) {
             case CURLE_OK:
@@ -98,33 +191,27 @@ namespace {
             case CURLE_OPERATION_TIMEDOUT:
                 return errors::timed_out;
             case CURLE_COULDNT_CONNECT:
-                // Can happen if direct or proxy connection fails
                 return errors::http_error;
             case CURLE_COULDNT_RESOLVE_HOST:
                 return errors::invalid_hostname;
             case CURLE_COULDNT_RESOLVE_PROXY:
-                // Specific error if proxy hostname resolution fails
                 return errors::invalid_hostname;
             case CURLE_SSL_CONNECT_ERROR:
             case CURLE_SSL_CERTPROBLEM:
                 return errors::invalid_ssl_cert;
             case CURLE_OUT_OF_MEMORY:
                 return errors::no_memory;
-            // Handle write error (e.g., exceeding max_size in write callback)
             case CURLE_WRITE_ERROR:
                 return errors::http_error;
-            // Handle file size exceeded (from CURLOPT_MAXFILESIZE_LARGE)
             case CURLE_FILESIZE_EXCEEDED:
                 return errors::http_error;
             case CURLE_UNSUPPORTED_PROTOCOL:
-                // Occurs if protocol restriction blocks it (e.g. FTP)
                 return errors::unsupported_url_protocol;
             default:
                 return errors::http_error;
         }
     }
 
-    // Check if error is retryable
     bool is_retryable_error(error_code const& ec) {
         return ec == errors::timed_out ||
                ec == errors::http_error ||
@@ -132,7 +219,7 @@ namespace {
     }
 
     // Helper function to configure proxy settings
-    void configure_proxy(CURL* easy, session_settings const& settings) {
+    void configure_proxy(CURL* easy, session_settings const& settings, curl_transfer_data* transfer_data) {
         // Check if proxy should be used for tracker connections
         if (!settings.get_bool(settings_pack::proxy_tracker_connections)) {
             return;
@@ -147,7 +234,9 @@ namespace {
         }
 
         // Configure proxy host and port
-        curl_easy_setopt(easy, CURLOPT_PROXY, proxy_host.c_str());
+        // SAFETY: Store proxy hostname for lifetime safety
+        transfer_data->proxy_hostname_storage = proxy_host;
+        curl_easy_setopt(easy, CURLOPT_PROXY, transfer_data->proxy_hostname_storage.c_str());
         curl_easy_setopt(easy, CURLOPT_PROXYPORT, static_cast<long>(proxy_port));
 
         // Configure proxy type
@@ -187,10 +276,14 @@ namespace {
 
             if (!username.empty()) {
                 // SECURITY FIX: Use separate username/password options instead of concatenation
-                curl_easy_setopt(easy, CURLOPT_PROXYUSERNAME, username.c_str());
-                curl_easy_setopt(easy, CURLOPT_PROXYPASSWORD, password.c_str());
+                // SAFETY: Store credentials for lifetime safety
+                transfer_data->proxy_username_storage = username;
+                transfer_data->proxy_password_storage = password;
 
-                // Clear sensitive data immediately
+                curl_easy_setopt(easy, CURLOPT_PROXYUSERNAME, transfer_data->proxy_username_storage.c_str());
+                curl_easy_setopt(easy, CURLOPT_PROXYPASSWORD, transfer_data->proxy_password_storage.c_str());
+
+                // Clear sensitive data from local variables immediately
                 username.assign(username.size(), '\0');
                 password.assign(password.size(), '\0');
 
@@ -201,36 +294,47 @@ namespace {
             }
         }
 
-        // Security: Ensure that no addresses (like localhost) bypass the proxy if one is configured.
-        // Setting NOPROXY to "" ensures even localhost is proxied if configured.
-        curl_easy_setopt(easy, CURLOPT_NOPROXY, "");
+        // Security: Only force proxy for internal addresses if explicitly configured
+        // This prevents exposing internal traffic to external proxies (SSRF protection)
+        if (settings.get_bool(settings_pack::proxy_force_internal_addresses)) {
+            // User explicitly wants to proxy internal addresses (e.g., for testing)
+            curl_easy_setopt(easy, CURLOPT_NOPROXY, "");
+#ifndef TORRENT_DISABLE_LOGGING
+            static std::once_flag force_proxy_flag;
+            std::call_once(force_proxy_flag, [] {
+                std::fprintf(stderr, "WARNING: Forcing proxy for all addresses including localhost (proxy_force_internal_addresses=true)\n");
+            });
+#endif
+        }
     }
 
-    // Helper function to configure SSL/TLS settings
-    void configure_ssl(CURL* easy, session_settings const& settings) {
-        // SSL verification (use tracker_ssl_verify_peer/host as these are used in tests)
+    void configure_ssl(CURL* easy, session_settings const& settings, std::string const& ca_cert_path) {
+
         bool verify_peer = settings.get_bool(settings_pack::tracker_ssl_verify_peer);
         bool verify_host = settings.get_bool(settings_pack::tracker_ssl_verify_host);
-        
+
         if (verify_peer) {
             curl_easy_setopt(easy, CURLOPT_SSL_VERIFYPEER, 1L);
         } else {
             curl_easy_setopt(easy, CURLOPT_SSL_VERIFYPEER, 0L);
-            
+
             // WARNING: SSL certificate verification disabled
-            #ifndef TORRENT_DISABLE_LOGGING
+#ifndef TORRENT_DISABLE_LOGGING
             static std::once_flag peer_warning_flag;
             std::call_once(peer_warning_flag, [] {
                 std::fprintf(stderr, "WARNING: SSL certificate verification disabled for tracker connections\n");
             });
+#endif
             #endif
-            
+
             // In production builds, log a more severe warning
             #ifdef TORRENT_PRODUCTION
             static std::once_flag prod_peer_warning_flag;
+#ifndef TORRENT_DISABLE_LOGGING
             std::call_once(prod_peer_warning_flag, [] {
                 std::fprintf(stderr, "SECURITY WARNING: SSL peer verification disabled in production build!\n");
             });
+#endif
             #endif
         }
 
@@ -238,13 +342,15 @@ namespace {
             curl_easy_setopt(easy, CURLOPT_SSL_VERIFYHOST, 2L);
         } else {
             curl_easy_setopt(easy, CURLOPT_SSL_VERIFYHOST, 0L);
-            
+
             // WARNING: SSL hostname verification disabled
             #ifndef TORRENT_DISABLE_LOGGING
             static std::once_flag host_warning_flag;
+#ifndef TORRENT_DISABLE_LOGGING
             std::call_once(host_warning_flag, [] {
                 std::fprintf(stderr, "WARNING: SSL hostname verification disabled for tracker connections\n");
             });
+#endif
             #endif
         }
 
@@ -255,9 +361,18 @@ namespace {
         // Map libtorrent TLS version to libcurl constants
         // 0x0301 = TLS 1.0, 0x0302 = TLS 1.1, 0x0303 = TLS 1.2, 0x0304 = TLS 1.3
         switch (min_tls_version) {
-            case 0x0302: // TLS 1.1
-                curl_tls_version = CURL_SSLVERSION_TLSv1_1;
-                break;
+            case 0x0302: // TLS 1.1 - DEPRECATED (RFC 8996)
+                // SECURITY: TLS 1.1 is cryptographically broken, upgrade to 1.2
+#ifndef TORRENT_DISABLE_LOGGING
+                static std::once_flag tls11_warning_flag;
+#ifndef TORRENT_DISABLE_LOGGING
+                std::call_once(tls11_warning_flag, [] {
+                    std::fprintf(stderr, "WARNING: TLS 1.1 requested but upgrading to 1.2 (TLS 1.1 is deprecated)\n");
+                });
+#endif
+#endif
+                // Fall through to TLS 1.2
+                [[fallthrough]];
             case 0x0303: // TLS 1.2
                 curl_tls_version = CURL_SSLVERSION_TLSv1_2;
                 break;
@@ -282,6 +397,20 @@ namespace {
             "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:"
             "!aNULL:!eNULL:!EXPORT:!DES:!MD5:!PSK:!RC4:!3DES:!DSS");
 
+        // Set custom CA certificate bundle if provided
+        // Use stored path to avoid string lifetime issues
+        if (!ca_cert_path.empty()) {
+            curl_easy_setopt(easy, CURLOPT_CAINFO, ca_cert_path.c_str());
+
+            #ifndef TORRENT_DISABLE_LOGGING
+            static std::once_flag ca_cert_flag;
+#ifndef TORRENT_DISABLE_LOGGING
+            std::call_once(ca_cert_flag, [&ca_cert_path] {
+                std::fprintf(stderr, "Using custom CA certificate bundle: %s\n", ca_cert_path.c_str());
+            });
+#endif
+            #endif
+        }
     }
 }
 
@@ -320,6 +449,7 @@ std::shared_ptr<curl_thread_manager> curl_thread_manager::create(
 curl_thread_manager::curl_thread_manager(io_context& ios, session_settings const& settings)
     : m_ios(ios)
     , m_settings(settings)
+    , m_ca_cert_path(settings.get_str(settings_pack::tracker_ca_certificate))
     , m_wakeup_timer(ios)
 {
     // Ensure curl is initialized globally (thread-safe with std::once_flag)
@@ -397,7 +527,7 @@ void curl_thread_manager::perform_wakeup() {
     // FIX: Allow wakeup during shutdown to prevent deadlock
     // The curl thread needs to wake up from curl_multi_poll() to check
     // the shutdown flag and exit cleanly
-    
+
     CURLM* multi = m_multi_handle.load();
     if (multi) {
         CURLMcode rc = curl_multi_wakeup(multi);
@@ -410,23 +540,23 @@ void curl_thread_manager::perform_wakeup() {
 
 void curl_thread_manager::process_queue_notification() {
     // This runs ONLY on the IO thread
-    
+
     // CRITICAL: Do NOT clear m_notification_pending here
     // It must remain true until the timer fires to avoid lost notifications
-    
-    if (m_shutting_down.load()) {
+
+    if (m_shutting_down.load(std::memory_order_acquire)) {
         return;
     }
-    
+
     if (m_timer_running) {
         // Timer is already running, will check m_notification_pending when it fires
         return;
     }
-    
+
     // Start the timer for batching
     m_timer_running = true;
     m_wakeup_timer.expires_after(WAKEUP_DELAY);
-    
+
     // Use async_wait with proper lifetime management
     m_wakeup_timer.async_wait([self = shared_from_this()](boost::system::error_code const& ec) {
         self->on_timer(ec);
@@ -435,21 +565,22 @@ void curl_thread_manager::process_queue_notification() {
 
 void curl_thread_manager::on_timer(boost::system::error_code const& ec) {
     // This runs ONLY on the IO thread
-    
+
     // Timer has completed
     m_timer_running = false;
-    
+
     if (ec || m_shutting_down.load()) {
         // Timer was cancelled or we're shutting down
         return;
     }
-    
+
     // The batch window has closed, wake up the curl thread
     perform_wakeup();
-    
+
     // CRITICAL FIX: Atomically check AND clear the flag
     // This ensures we don't lose notifications that arrived during the batch window
-    if (m_notification_pending.exchange(false)) {
+    // Use acquire-release semantics for proper cross-thread synchronization
+    if (m_notification_pending.exchange(false, std::memory_order_acq_rel)) {
         // Requests arrived during the batch window, start next batch
         // Restart the timer for the next batch
         m_timer_running = true;
@@ -495,9 +626,14 @@ void curl_thread_manager::add_request(
         m_total_requests++;
     }
 
+    // Increment version counter for debugging/monitoring
+    m_notification_version.fetch_add(1, std::memory_order_relaxed);
+
     // Notify I/O thread for batched wakeup with proper lifetime management
+    // Try to set notification flag from false to true
     bool expected = false;
-    if (m_notification_pending.compare_exchange_strong(expected, true)) {
+    if (m_notification_pending.compare_exchange_strong(expected, true,
+        std::memory_order_acq_rel, std::memory_order_acquire)) {
         // Post notification with shared_from_this for safety
         boost::asio::post(m_ios, [self = shared_from_this()]() {
             self->process_queue_notification();
@@ -521,7 +657,7 @@ std::vector<curl_request> curl_thread_manager::swap_pending_requests() {
 }
 
 // Centralized configuration for CURL handles
-bool curl_thread_manager::configure_handle(CURL* easy, curl_request const& req) {
+bool curl_thread_manager::configure_handle(CURL* easy, curl_request const& req, curl_transfer_data* transfer_data) {
 
     // Calculate timeout based on deadline
     auto now = clock_type::now();
@@ -531,7 +667,8 @@ bool curl_thread_manager::configure_handle(CURL* easy, curl_request const& req) 
     long timeout_sec = std::max(1L, timeout_ms / 1000);
 
     // Basic configuration
-    curl_easy_setopt(easy, CURLOPT_URL, req.url.c_str());
+    // SAFETY: Use stored URL from transfer_data to ensure lifetime safety
+    curl_easy_setopt(easy, CURLOPT_URL, transfer_data->url_storage.c_str());
     curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, write_callback);
     // NOTE: CURLOPT_WRITEDATA is now set by the caller with transfer_data->response.get()
     // This ensures proper lifetime management of the response buffer
@@ -539,7 +676,23 @@ bool curl_thread_manager::configure_handle(CURL* easy, curl_request const& req) 
     // Set user-agent for tracker requests
     std::string user_agent = m_settings.get_str(settings_pack::user_agent);
     if (!user_agent.empty()) {
-        curl_easy_setopt(easy, CURLOPT_USERAGENT, user_agent.c_str());
+        // SAFETY: Store user agent for lifetime safety
+        transfer_data->user_agent_storage = std::move(user_agent);
+        curl_easy_setopt(easy, CURLOPT_USERAGENT, transfer_data->user_agent_storage.c_str());
+    }
+
+    // Network interface binding (if configured)
+    std::string outgoing_interface = m_settings.get_str(settings_pack::outgoing_interfaces);
+    if (!outgoing_interface.empty()) {
+        // Parse comma-separated list and select one
+        // (simplified - actual implementation should rotate through interfaces)
+        size_t comma_pos = outgoing_interface.find(',');
+        if (comma_pos != std::string::npos) {
+            outgoing_interface = outgoing_interface.substr(0, comma_pos);
+        }
+        // SAFETY: Store interface for lifetime safety
+        transfer_data->interface_storage = std::move(outgoing_interface);
+        curl_easy_setopt(easy, CURLOPT_INTERFACE, transfer_data->interface_storage.c_str());
     }
 
     // CRITICAL SECURITY FIX: Disable redirects to prevent SSRF attacks
@@ -549,6 +702,13 @@ bool curl_thread_manager::configure_handle(CURL* easy, curl_request const& req) 
     curl_easy_setopt(easy, CURLOPT_TIMEOUT, timeout_sec);
     curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT, std::min(10L, timeout_sec));
     curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L); // Essential for multi-threading
+
+    // PERFORMANCE: Configure DNS caching to reduce lookup overhead
+    // Default to 5 minutes (300 seconds) cache timeout
+    curl_easy_setopt(easy, CURLOPT_DNS_CACHE_TIMEOUT, 300L);
+
+    // Note: DNS-over-HTTPS (DOH) could be added in the future via CURLOPT_DOH_URL
+    // if libtorrent adds a doh_url setting. For now, use system DNS.
 
     // SECURITY FIX: Add response size limits for headers too
     curl_easy_setopt(easy, CURLOPT_MAXFILESIZE_LARGE,
@@ -563,8 +723,11 @@ bool curl_thread_manager::configure_handle(CURL* easy, curl_request const& req) 
     // Use newer API if available (libcurl 7.85.0+)
     curl_easy_setopt(easy, CURLOPT_PROTOCOLS_STR, "http,https");
 #else
-    // Fall back to older API
+    // Fall back to older API - suppress deprecation warning as this is for older curl versions
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     curl_easy_setopt(easy, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#pragma GCC diagnostic pop
 #endif
 
     // Enable connection reuse (TCP Keepalive)
@@ -586,14 +749,20 @@ bool curl_thread_manager::configure_handle(CURL* easy, curl_request const& req) 
         #ifdef CURLOPT_HTTP2_WINDOW_SIZE
         curl_easy_setopt(easy, CURLOPT_HTTP2_WINDOW_SIZE, 10485760L); // 10MB window
         #endif
+
+        // Disable HTTP2 Server push
+        #ifdef CURLOPT_HTTP2_SERVER_PUSH
+        curl_easy_setopt(easy, CURLOPT_HTTP2_SERVER_PUSH, 0L);
+        #endif
+
     }
 #endif
 
     // Configure Proxy settings
-    configure_proxy(easy, m_settings);
+    configure_proxy(easy, m_settings, transfer_data);
 
     // Configure SSL/TLS settings
-    configure_ssl(easy, m_settings);
+    configure_ssl(easy, m_settings, m_ca_cert_path);
 
     return true;
 }
@@ -613,34 +782,39 @@ void curl_thread_manager::curl_thread_func() {
             curl_multi_handle multi;
             // The curl_multi_handle constructor throws on failure, so no need for explicit check
 
-        // Configure multi handle for connection pooling
+        // Configure multi handle for connection pooling with dynamic scaling
         // Check if HTTP/2 is enabled to set appropriate connection limits
         bool http2_enabled = m_settings.get_bool(settings_pack::enable_http2_trackers);
 
+        // Initial configuration with current tracker count
+        long max_connections = calculate_optimal_connections();
+        m_current_connection_limit.store(max_connections);
+
+        // IMPORTANT: Always limit to 2 connections per host (HTTP/1.1 standard)
+        curl_multi_setopt(multi.get(), CURLMOPT_MAX_HOST_CONNECTIONS, 2L);
+
         if (http2_enabled) {
-            // HTTP/2: Use fewer connections with more streams multiplexed
-            curl_multi_setopt(multi.get(), CURLMOPT_MAX_HOST_CONNECTIONS, 2L);  // Only 2 connections per host
-            curl_multi_setopt(multi.get(), CURLMOPT_MAX_TOTAL_CONNECTIONS, 50L);  // Reduced total connections
-
-            #ifdef CURLMOPT_MAX_CONCURRENT_STREAMS
-            // Set max concurrent streams per connection (if supported)
-            curl_multi_setopt(multi.get(), CURLMOPT_MAX_CONCURRENT_STREAMS, 100L);
-            #endif
-
+            // HTTP/2: Enable multiplexing
             #ifdef CURLPIPE_MULTIPLEX
-            // Enable HTTP/2 multiplexing
             curl_multi_setopt(multi.get(), CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
             #endif
-        } else {
-            // HTTP/1.1: Traditional connection pooling
-            curl_multi_setopt(multi.get(), CURLMOPT_MAX_HOST_CONNECTIONS, 6L);
-            curl_multi_setopt(multi.get(), CURLMOPT_MAX_TOTAL_CONNECTIONS, 100L);
 
+            #ifdef CURLMOPT_MAX_CONCURRENT_STREAMS
+            // Set max concurrent streams per connection
+            curl_multi_setopt(multi.get(), CURLMOPT_MAX_CONCURRENT_STREAMS, 100L);
+            #endif
+        } else {
+            // HTTP/1.1: No multiplexing
             #ifdef CURLPIPE_HTTP1
-            // Enable HTTP/1.1 pipelining if available
+            // Enable HTTP/1.1 pipelining if available (though many servers don't support it)
             curl_multi_setopt(multi.get(), CURLMOPT_PIPELINING, CURLPIPE_HTTP1);
+            #else
+            curl_multi_setopt(multi.get(), CURLMOPT_PIPELINING, CURLPIPE_NOTHING);
             #endif
         }
+
+        // Set initial total connection limit based on tracker count
+        curl_multi_setopt(multi.get(), CURLMOPT_MAX_TOTAL_CONNECTIONS, max_connections);
 
         // Add connection pool monitoring (reduces penalty for wrong Content-Length)
         #ifdef CURLMOPT_CONTENT_LENGTH_PENALTY_SIZE
@@ -680,7 +854,7 @@ void curl_thread_manager::curl_thread_func() {
                 }
 
                 CURL* easy = context->transfer_data->easy_handle.get();
-                if (!configure_handle(easy, context->request)) {
+                if (!configure_handle(easy, context->request, context->transfer_data.get())) {
                     // No manual delete needed - shared_ptr handles cleanup
                     boost::asio::post(m_ios, [handler = context->request.completion_handler]() {
                         handler(errors::timed_out, std::vector<char>{});
@@ -708,19 +882,18 @@ void curl_thread_manager::curl_thread_func() {
 
             // Process retry queue
             auto now = clock_type::now();
-            
+
             // Track if we add any retries back to curl_multi
             bool retries_added = false;
 
             // Use iterator-based approach with multiset for safe extraction
             auto it = m_retry_queue.begin();
-            
+
             // Only print debug if we have retries that are ready to process
             if (it != m_retry_queue.end() && it->scheduled_time <= now) {
-                std::fprintf(stderr, "DEBUG: Processing %zu items from retry queue\n", m_retry_queue.size());
-                std::fflush(stderr);
+// Removed verbose debug logging
             }
-            
+
             while (it != m_retry_queue.end() && it->scheduled_time <= now) {
                 // Copy the retry item (C++14 compatible)
                 retry_item item = *it;
@@ -728,9 +901,7 @@ void curl_thread_manager::curl_thread_func() {
                 it = m_retry_queue.erase(it);
                 curl_request req = std::move(item.request);
 
-                std::fprintf(stderr, "DEBUG: Processing retry #%d from queue for %s\n",
-                            req.retry_count, req.url.c_str());
-                std::fflush(stderr);
+// Removed verbose debug logging
 
                 // Check if still within deadline
                 if (now >= req.deadline) {
@@ -758,7 +929,7 @@ void curl_thread_manager::curl_thread_func() {
 
                 CURL* easy = context->transfer_data->easy_handle.get();
                 // Configure the request using the centralized helper
-                if (!configure_handle(easy, context->request)) {
+                if (!configure_handle(easy, context->request, context->transfer_data.get())) {
                     // Configuration failed (e.g., already past deadline)
                     // No manual delete needed - shared_ptr handles cleanup
                     boost::asio::post(m_ios, [handler = context->request.completion_handler]() {
@@ -803,11 +974,7 @@ void curl_thread_manager::curl_thread_func() {
                 int completed = process_completions(multi.get());
                 total_completions += completed;
 
-                // DEBUG: Track if we got any completions
-                if (completed > 0) {
-                    std::fprintf(stderr, "DEBUG: process_completions returned %d completions\n", completed);
-                    std::fflush(stderr);
-                }
+                // Process completions silently
 
                 if (completed > 0) {
                     // If completions happened, slots are free. Force immediate re-perform.
@@ -845,9 +1012,9 @@ void curl_thread_manager::curl_thread_func() {
                 for (auto& pair : m_active_requests) {
                     CURL* easy = pair.first;
                     auto& context = pair.second;
-                    
+
                     curl_multi_remove_handle(multi.get(), easy);
-                    
+
                     // Post error callback for canceled request
                     auto handler = context->request.completion_handler;
                     boost::asio::post(m_ios, [handler]() {
@@ -855,7 +1022,7 @@ void curl_thread_manager::curl_thread_func() {
                     });
                 }
                 m_active_requests.clear();
-                
+
                 // Cancel all retry queue items as well
                 for (auto& item : m_retry_queue) {
                     auto handler = item.request.completion_handler;
@@ -864,7 +1031,7 @@ void curl_thread_manager::curl_thread_func() {
                     });
                 }
                 m_retry_queue.clear();
-                
+
                 // Now exit - all requests canceled
                 break;
             }
@@ -893,6 +1060,19 @@ void curl_thread_manager::curl_thread_func() {
                 // Brief sleep to prevent spin on persistent error
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
+
+            // Check if connection pool needs immediate update (from tracker add/remove)
+            if (m_pool_needs_update.exchange(false)) {
+                long new_limit = m_new_connection_limit.load();
+                if (new_limit != max_connections) {
+                    max_connections = new_limit;
+                    m_current_connection_limit.store(max_connections);
+                    curl_multi_setopt(multi.get(), CURLMOPT_MAX_TOTAL_CONNECTIONS, max_connections);
+#ifndef TORRENT_DISABLE_LOGGING
+                    std::fprintf(stderr, "*** CURL_TRACKER adjusted pool: %ld connections\n", max_connections);
+#endif
+                }
+            }
         }
 
         // Cleanup on shutdown - no manual cleanup needed with shared_ptr
@@ -915,7 +1095,9 @@ void curl_thread_manager::curl_thread_func() {
 
         } catch (const std::exception& e) {
             // Log error and notify main thread
+#ifndef TORRENT_DISABLE_LOGGING
             std::fprintf(stderr, "curl thread error: %s\n", e.what());
+#endif
 
             // Signal initialization failure if we haven't initialized yet
             {
@@ -931,7 +1113,9 @@ void curl_thread_manager::curl_thread_func() {
             m_multi_handle = nullptr;
     } catch (...) {
         // Handle unknown exceptions
+#ifndef TORRENT_DISABLE_LOGGING
         std::fprintf(stderr, "curl thread: unknown error\n");
+#endif
 
         // Signal initialization failure if we haven't initialized yet
         {
@@ -960,8 +1144,7 @@ int curl_thread_manager::process_completions(CURLM* multi) {
     while ((msg = curl_multi_info_read(multi, &msgs_left))) {
         // DEBUG: Log any completed message
         if (msg->msg == CURLMSG_DONE) {
-            std::fprintf(stderr, "DEBUG: Got CURLMSG_DONE with result=%d\n", msg->data.result);
-            std::fflush(stderr);
+// Removed verbose debug logging
         }
         if (msg->msg != CURLMSG_DONE) continue;
 
@@ -992,11 +1175,7 @@ int curl_thread_manager::process_completions(CURLM* multi) {
         // Determine error code
         error_code ec = curl_error_to_libtorrent(result);
 
-        // DEBUG: Log CURL write errors
-        if (result == CURLE_WRITE_ERROR) {
-            std::fprintf(stderr, "DEBUG: CURLE_WRITE_ERROR for %s\n", req.url.c_str());
-            std::fflush(stderr);
-        }
+        // Handle CURL write errors silently
 
         if (!ec) {
             // Check HTTP status code
@@ -1008,16 +1187,12 @@ int curl_thread_manager::process_completions(CURLM* multi) {
 
                 // Consider retry for server errors
                 if (response_code >= 500 && req.retry_count < req.max_retries) {
-                    std::fprintf(stderr, "DEBUG: HTTP %ld - scheduling retry %d/%d for %s\n",
-                                response_code, req.retry_count + 1, req.max_retries, req.url.c_str());
-                    std::fflush(stderr);
+// Retry silently
                     // No manual cleanup needed - shared_ptr handles everything
                     schedule_retry(std::move(req));
                     continue;
                 } else if (response_code >= 500) {
-                    std::fprintf(stderr, "DEBUG: HTTP %ld - exhausted retries (%d/%d) for %s\n",
-                                response_code, req.retry_count, req.max_retries, req.url.c_str());
-                    std::fflush(stderr);
+// Exhausted retries silently
                 }
             }
         } else if (is_retryable_error(ec)) {
@@ -1029,6 +1204,7 @@ int curl_thread_manager::process_completions(CURLM* multi) {
                 result != CURLE_COULDNT_RESOLVE_PROXY &&
                 result != CURLE_COULDNT_RESOLVE_HOST &&  // DNS failures won't be fixed by retry
                 result != CURLE_COULDNT_CONNECT &&  // Connection failures mean server is down
+                result != CURLE_INTERFACE_FAILED &&  // Interface binding errors won't be fixed by retry
                 req.retry_count < req.max_retries &&
                 clock_type::now() < req.deadline) {
                 // No manual cleanup needed - shared_ptr handles everything
@@ -1051,11 +1227,7 @@ int curl_thread_manager::process_completions(CURLM* multi) {
 
         // No manual cleanup needed - shared_ptr handles everything when context goes out of scope
 
-        // DEBUG: Log completion posting
-        if (result == CURLE_WRITE_ERROR) {
-            std::fprintf(stderr, "DEBUG: Posting completion handler for WRITE_ERROR with ec=%d\n", ec.value());
-            std::fflush(stderr);
-        }
+        // Post completion handler silently
 
         boost::asio::post(m_ios,
             [handler, ec, response = std::move(response)]() {
@@ -1091,7 +1263,7 @@ void curl_thread_manager::schedule_retry(curl_request req) {
 
     // Insert into multiset (safe, no const_cast needed)
     m_retry_queue.insert({retry_time, std::move(req)});
-    
+
     // Note: No need to wake the curl thread here. The thread will wake up
     // naturally when its timeout expires, and calculate_wait_timeout() will
     // ensure it wakes up when the retry is ready.
@@ -1146,6 +1318,61 @@ long curl_thread_manager::calculate_wait_timeout(CURLM* multi) const {
 
     // Safety: Never return negative timeout
     return std::max(0L, wait_ms);
+}
+
+// Calculate optimal number of connections based on tracker count for dynamic scaling
+long curl_thread_manager::calculate_optimal_connections() const {
+    // Get current unique tracker count (O(1) operation)
+    size_t unique_trackers = m_tracker_counter.unique_count();
+
+    // Strategy: 2 connections per unique tracker (HTTP/1.1 standard)
+    // With HTTP/2, these 2 connections can multiplex many streams
+    long tracker_based = static_cast<long>(unique_trackers * 2);
+
+    // Get system limits as a safety cap
+    long system_limit = 1000; // Conservative default
+
+#ifdef _WIN32
+    // Windows: Query actual handle limit
+    system_limit = _getmaxstdio();
+    if (system_limit < 256) {
+        _setmaxstdio(2048);
+        system_limit = 2048;
+    }
+#else
+    // POSIX systems - check file descriptor limit
+    struct rlimit rlim;
+    if (getrlimit(RLIMIT_NOFILE, &rlim) == 0) {
+        // Use 25% of system limit for libcurl
+        system_limit = static_cast<long>(rlim.rlim_cur) / 4;
+    }
+#endif
+
+    // Apply reasonable limits
+    long optimal = tracker_based;
+    optimal = std::max(2L, optimal);            // Minimum 2 connections
+    optimal = std::min(optimal, system_limit);  // Respect system limits
+    optimal = std::min(optimal, 100L);          // Max 100 (50 unique trackers)
+
+    // Removed verbose connection pool logging
+
+    return optimal;
+}
+
+// Get statistics for monitoring
+curl_thread_stats curl_thread_manager::get_stats() const {
+    curl_thread_stats stats;
+    stats.unique_tracker_hosts = m_tracker_counter.unique_count();
+    stats.current_connection_limit = m_current_connection_limit.load();
+
+    // These need mutex protection to access safely
+    {
+        std::lock_guard<std::mutex> lock(m_queue_mutex);
+        stats.queued_requests = m_request_queue.size();
+    }
+    stats.active_requests = m_active_requests.size();
+
+    return stats;
 }
 
 }} // namespace libtorrent::aux

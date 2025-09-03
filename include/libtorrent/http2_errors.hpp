@@ -72,7 +72,6 @@ namespace libtorrent { namespace errors {
         http_503_service_unavailable = 10503
     };
 
-    // Error category for HTTP/2 specific errors
     struct TORRENT_EXPORT http2_error_category : boost::system::error_category {
         const char* name() const BOOST_SYSTEM_NOEXCEPT override;
         std::string message(int ev) const override;
@@ -81,7 +80,6 @@ namespace libtorrent { namespace errors {
         static http2_error_category& instance();
     };
 
-    // Helper function to create error codes
     inline boost::system::error_code make_error_code(http2_errors e) {
         return boost::system::error_code(
             static_cast<int>(e), 

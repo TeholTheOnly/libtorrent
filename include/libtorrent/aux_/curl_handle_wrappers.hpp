@@ -61,11 +61,9 @@ public:
         }
     }
     
-    // Non-copyable
     curl_easy_handle(const curl_easy_handle&) = delete;
     curl_easy_handle& operator=(const curl_easy_handle&) = delete;
     
-    // Movable
     curl_easy_handle(curl_easy_handle&& other) noexcept 
         : m_handle(std::exchange(other.m_handle, nullptr)) {}
     
@@ -114,11 +112,9 @@ public:
         }
     }
     
-    // Non-copyable
     curl_multi_handle(const curl_multi_handle&) = delete;
     curl_multi_handle& operator=(const curl_multi_handle&) = delete;
     
-    // Movable
     curl_multi_handle(curl_multi_handle&& other) noexcept 
         : m_handle(std::exchange(other.m_handle, nullptr)) {}
     
@@ -137,7 +133,6 @@ public:
         return std::exchange(m_handle, nullptr); 
     }
     
-    // Convenience setopt wrapper
     void setopt(CURLMoption option, long value) {
         CURLMcode res = curl_multi_setopt(m_handle, option, value);
         if (res != CURLM_OK) {

@@ -767,20 +767,34 @@ if(CURL_FOUND)
 	target_link_libraries(torrent-rasterbar PUBLIC CURL::libcurl)
 	target_compile_definitions(torrent-rasterbar PUBLIC TORRENT_USE_LIBCURL)
 
-	# Check for HTTP/2 support in libcurl
 	include(CheckCSourceRuns)
+	include(CheckCSourceCompiles)
 	set(CMAKE_REQUIRED_LIBRARIES ${CURL_LIBRARIES})
 	set(CMAKE_REQUIRED_INCLUDES ${CURL_INCLUDE_DIRS})
-	check_c_source_runs("
-		#include <curl/curl.h>
-		int main() {
-			curl_version_info_data *data = curl_version_info(CURLVERSION_NOW);
-			return (data->features & CURL_VERSION_HTTP2) ? 0 : 1;
-		}
-	" CURL_HAS_HTTP2)
+
+	# Handle cross-compilation properly
+	if(CMAKE_CROSSCOMPILING)
+		check_c_source_compiles("
+			#include <curl/curl.h>
+			int main() {
+				#ifndef CURL_VERSION_HTTP2
+				#error \"HTTP/2 not supported\"
+				#endif
+				return 0;
+			}
+		" CURL_HAS_HTTP2)
+	else()
+		check_c_source_runs("
+			#include <curl/curl.h>
+			int main() {
+				curl_version_info_data *data = curl_version_info(CURLVERSION_NOW);
+				return (data->features & CURL_VERSION_HTTP2) ? 0 : 1;
+			}
+		" CURL_HAS_HTTP2)
+	endif()
 
 	if(CURL_HAS_HTTP2)
-		target_compile_definitions(torrent-rasterbar PUBLIC TORRENT_CURL_HAS_HTTP2)
+		target_compile_definitions(torrent-rasterbar PUBLIC)
 		message(STATUS "libcurl has HTTP/2 support")
 	else()
 		message(WARNING "libcurl does not have HTTP/2 support")

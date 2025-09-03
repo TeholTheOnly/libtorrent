@@ -37,7 +37,6 @@ POSSIBILITY OF SUCH DAMAGE.
 using namespace libtorrent;
 using namespace libtorrent::errors;
 
-// Test error code creation
 TORRENT_TEST(http2_error_code_creation)
 {
     error_code ec = make_error_code(errors::http2_alpn_negotiation_failed);
@@ -46,7 +45,6 @@ TORRENT_TEST(http2_error_code_creation)
     TEST_EQUAL(ec.category().name(), std::string("http2"));
 }
 
-// Test error messages
 TORRENT_TEST(http2_error_messages)
 {
     struct test_case {
@@ -72,12 +70,10 @@ TORRENT_TEST(http2_error_messages)
     }
 }
 
-// Test error code uniqueness (no conflicts)
 TORRENT_TEST(http2_error_code_uniqueness)
 {
     std::set<int> error_values;
     
-    // All HTTP/2 errors should be unique and in high range (10000+)
     int codes[] = {
         http2_alpn_negotiation_failed, http2_no_available_session, http2_goaway_received,
         http2_proxy_connect_failed, http2_protocol_error, http2_stream_limit_exceeded,
@@ -91,10 +87,8 @@ TORRENT_TEST(http2_error_code_uniqueness)
     }
 }
 
-// Test HTTP status code mapping
 TORRENT_TEST(http2_status_code_errors)
 {
-    // Test that HTTP status codes are properly offset
     TEST_EQUAL(static_cast<int>(http_400_bad_request), 10400);
     TEST_EQUAL(static_cast<int>(http_401_unauthorized), 10401);
     TEST_EQUAL(static_cast<int>(http_403_forbidden), 10403);
@@ -106,25 +100,20 @@ TORRENT_TEST(http2_status_code_errors)
     TEST_EQUAL(static_cast<int>(http_503_service_unavailable), 10503);
 }
 
-// Test error category behavior
 TORRENT_TEST(http2_error_category_behavior)
 {
     http2_error_category category;
     
-    // Test category name
     TEST_EQUAL(std::string(category.name()), "http2");
     
-    // Test unknown error code
     TEST_EQUAL(category.message(99999), "Unknown HTTP/2 error");
     
-    // Test that category is properly registered
     error_code ec1 = make_error_code(http2_alpn_negotiation_failed);
     error_code ec2 = make_error_code(http2_alpn_negotiation_failed);
     TEST_CHECK(ec1 == ec2);  // Same error codes should be equal
     TEST_CHECK(&ec1.category() == &ec2.category());  // Same category instance
 }
 
-// Test error code comparison
 TORRENT_TEST(http2_error_comparison)
 {
     error_code ec1 = make_error_code(http2_alpn_negotiation_failed);
@@ -136,10 +125,8 @@ TORRENT_TEST(http2_error_comparison)
     TEST_CHECK(ec1 == errors::http2_alpn_negotiation_failed);  // Direct comparison
 }
 
-// Test integration with boost::system
 TORRENT_TEST(http2_boost_system_integration)
 {
-    // Should work with standard error_code operations
     error_code ec;
     TEST_CHECK(!ec);  // Default is no error
     
@@ -147,7 +134,6 @@ TORRENT_TEST(http2_boost_system_integration)
     TEST_CHECK(ec);  // Has error
     TEST_CHECK(ec.value() != 0);
     
-    // Clear error
     ec.clear();
     TEST_CHECK(!ec);
     TEST_EQUAL(ec.value(), 0);

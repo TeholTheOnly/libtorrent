@@ -3,6 +3,20 @@ import feature : feature ;
 
 use-project /torrent : .. ;
 
+# Rule to check for use-libcurl and add appropriate defines
+rule use-libcurl-config ( properties * )
+{
+    local result ;
+    local use-libcurl = [ feature.get-values <use-libcurl> : $(properties) ] ;
+    
+    if $(use-libcurl) = "on"
+    {
+        result += <define>TORRENT_USE_LIBCURL ;
+    }
+    
+    return $(result) ;
+}
+
 lib libtorrent_test
 	: # sources
 	main.cpp
@@ -74,6 +88,7 @@ project
 	<toolset>msvc:<cxxflags>/wd4268
 	<toolset>clang:<cflags>-Wno-implicit-int-float-conversion
 	<conditional>@warnings
+	<conditional>@use-libcurl-config
 	<export-extra>on
 	: default-build
 	$(default-build)
@@ -181,11 +196,12 @@ run test_http2_errors.cpp ;
 run test_tracker_interface.cpp ;
 # Disabled - curl_tracker_manager was integrated into tracker_manager
 # run test_curl_tracker_manager.cpp ;
-run test_curl_tracker_client.cpp ;
-run test_curl_security.cpp ;
-run test_curl_integration.cpp ;
-run test_curl_thread_manager.cpp ;
-run test_idle_cpu_bug.cpp ;
+run test_curl_tracker_client.cpp : : : <library>/torrent//curl ;
+run test_curl_security.cpp : : : <library>/torrent//curl ;
+run test_curl_integration.cpp : : : <library>/torrent//curl ;
+run test_curl_thread_manager.cpp : : : <library>/torrent//curl ;
+run test_http2_announces.cpp ;
+run test_idle_cpu_bug.cpp : : : <library>/torrent//curl ;
 run test_receive_buffer.cpp ;
 run test_alert_manager.cpp ;
 run test_apply_pad.cpp ;

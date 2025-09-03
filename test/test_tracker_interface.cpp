@@ -8,16 +8,13 @@
 using namespace libtorrent;
 using namespace libtorrent::aux;
 
-// Test interface methods exist
 TORRENT_TEST(tracker_interface_contract)
 {
     io_context ios;
     settings_pack settings;
 
-    // Create mock implementation
     auto client = std::make_unique<mock_tracker_client>(ios, settings);
 
-    // Verify interface methods are callable
     tracker_request req;
     req.url = "http://tracker.example.com/announce";
     req.info_hash = sha1_hash("01234567890123456789");
@@ -38,14 +35,12 @@ TORRENT_TEST(tracker_interface_contract)
     TEST_CHECK(!ec);  // Mock should succeed
 }
 
-// Test announce method behavior
 TORRENT_TEST(tracker_announce_behavior)
 {
     io_context ios;
     settings_pack settings;
     mock_tracker_client client(ios, settings);
 
-    // Configure mock response
     tracker_response expected_response;
     expected_response.interval = seconds(1800);
     expected_response.min_interval = seconds(900);
@@ -54,7 +49,6 @@ TORRENT_TEST(tracker_announce_behavior)
 
     client.set_mock_response(expected_response);
 
-    // Test announce
     tracker_request req;
     req.kind = {}; // announce_request (default)
     req.event = event_t::started;
@@ -79,7 +73,6 @@ TORRENT_TEST(tracker_announce_behavior)
     TEST_EQUAL(resp.incomplete, expected_response.incomplete);
 }
 
-// Test scrape method behavior
 TORRENT_TEST(tracker_scrape_behavior)
 {
     io_context ios;
@@ -106,14 +99,12 @@ TORRENT_TEST(tracker_scrape_behavior)
     TEST_CHECK(resp.incomplete >= 0);
 }
 
-// Test connection reuse
 TORRENT_TEST(tracker_connection_reuse)
 {
     io_context ios;
     settings_pack settings;
     mock_tracker_client client(ios, settings);
 
-    // First request
     TEST_CHECK(client.can_reuse());
 
     tracker_request req;
@@ -123,7 +114,6 @@ TORRENT_TEST(tracker_connection_reuse)
     TEST_CHECK(client.can_reuse());
 }
 
-// Test close behavior
 TORRENT_TEST(tracker_close_behavior)
 {
     io_context ios;
@@ -152,14 +142,12 @@ TORRENT_TEST(tracker_close_behavior)
     TEST_CHECK(ec);  // Should have error
 }
 
-// Test error propagation
 TORRENT_TEST(tracker_error_handling)
 {
     io_context ios;
     settings_pack settings;
     mock_tracker_client client(ios, settings);
 
-    // Configure mock to fail
     client.set_mock_error(make_error_code(boost::system::errc::connection_refused));
 
     tracker_request req;
@@ -178,14 +166,12 @@ TORRENT_TEST(tracker_error_handling)
     TEST_EQUAL(ec, make_error_code(boost::system::errc::connection_refused));
 }
 
-// Test async behavior
 TORRENT_TEST(tracker_async_operations)
 {
     io_context ios;
     settings_pack settings;
     mock_tracker_client client(ios, settings);
 
-    // Configure delay
     client.set_mock_delay(milliseconds(100));
 
     auto start = clock_type::now();

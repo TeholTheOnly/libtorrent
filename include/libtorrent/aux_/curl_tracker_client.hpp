@@ -69,7 +69,6 @@ public:
 	
 	~curl_tracker_client();
 	
-	// Main tracker operations
 	void announce(
 		tracker_request const& req,
 		std::function<void(error_code const&, tracker_response const&)> handler);
@@ -84,12 +83,10 @@ public:
 	void close();
 	
 private:
-	// URL building helpers
 	std::string build_announce_url(tracker_request const& req) const;
 	std::string build_scrape_url(tracker_request const& req) const;
 	std::string build_tracker_query(tracker_request const& req, bool scrape = false) const;
 	
-	// Convert scrape URL from announce URL
 	std::string scrape_url_from_announce(std::string const& announce) const;
 	
 private:

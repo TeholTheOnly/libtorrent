@@ -48,11 +48,9 @@ curl_tracker_connection::curl_tracker_connection(
 	: http_tracker_connection(ios, man, std::move(req), c)
 	, m_curl_thread_manager(std::move(curl_mgr))
 {
-	// Get the actual session settings and copy relevant tracker settings
 	aux::session_settings const& session_sett = m_man.settings();
 	settings_pack sett;
 	
-	// Copy all relevant tracker settings from the session
 	sett.set_bool(settings_pack::enable_http2_trackers, 
 		session_sett.get_bool(settings_pack::enable_http2_trackers));
 	sett.set_int(settings_pack::tracker_completion_timeout,
@@ -68,7 +66,6 @@ curl_tracker_connection::curl_tracker_connection(
 	sett.set_int(settings_pack::tracker_min_tls_version,
 		session_sett.get_int(settings_pack::tracker_min_tls_version));
 	
-	// Copy proxy settings from the session
 	sett.set_int(settings_pack::proxy_type,
 		session_sett.get_int(settings_pack::proxy_type));
 	sett.set_str(settings_pack::proxy_hostname,
@@ -84,13 +81,11 @@ curl_tracker_connection::curl_tracker_connection(
 	sett.set_bool(settings_pack::proxy_hostnames,
 		session_sett.get_bool(settings_pack::proxy_hostnames));
 	
-	// Copy other relevant settings
 	sett.set_str(settings_pack::user_agent,
 		session_sett.get_str(settings_pack::user_agent));
 	sett.set_int(settings_pack::connections_limit,
 		session_sett.get_int(settings_pack::connections_limit));
 
-	// Create the curl_tracker_client with the tracker URL and actual settings
 	m_client = std::make_unique<aux::curl_tracker_client>(
 		ios,
 		tracker_req().url,
@@ -105,10 +100,8 @@ void curl_tracker_connection::start()
 
 	std::shared_ptr<curl_tracker_connection> me = shared_from_this();
 
-	// Determine if this is an announce or scrape request
 	if (tracker_req().kind & tracker_request::scrape_request)
 	{
-		// Scrape request
 		m_client->scrape(tracker_req(),
 			[me](error_code const& ec, tracker_response const& resp)
 			{
@@ -117,7 +110,6 @@ void curl_tracker_connection::start()
 	}
 	else
 	{
-		// Announce request
 		m_client->announce(tracker_req(),
 			[me](error_code const& ec, tracker_response const& resp)
 			{
@@ -125,13 +117,12 @@ void curl_tracker_connection::start()
 			});
 	}
 
-	// Set timeout based on settings
 	aux::session_settings const& settings = m_man.settings();
 	int const timeout = settings.get_int(settings_pack::tracker_completion_timeout);
 	int const read_timeout = settings.get_int(settings_pack::tracker_receive_timeout);
 	set_timeout(timeout, read_timeout);
 
-	sent_bytes(0); // Update stats
+	sent_bytes(0);
 }
 
 void curl_tracker_connection::close()
@@ -155,10 +146,8 @@ void curl_tracker_connection::on_timeout(error_code const& /* ec */)
 
 void curl_tracker_connection::on_response(error_code const& ec, tracker_response const& resp)
 {
-	// Check if we've been cancelled
 	if (cancelled()) return;
 
-	// Cancel the timeout
 	cancel();
 
 	if (ec)
@@ -168,7 +157,6 @@ void curl_tracker_connection::on_response(error_code const& ec, tracker_response
 		return;
 	}
 
-	// Get the requester callback
 	std::shared_ptr<request_callback> cb = requester();
 	if (!cb)
 	{
@@ -176,10 +164,8 @@ void curl_tracker_connection::on_response(error_code const& ec, tracker_response
 		return;
 	}
 
-	// Update stats
 	received_bytes(0); // We don't have exact byte count from curl
 
-	// Call the appropriate callback based on request type
 	if (tracker_req().kind & tracker_request::scrape_request)
 	{
 		cb->tracker_scrape_response(tracker_req(), resp.complete,

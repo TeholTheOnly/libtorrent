@@ -78,6 +78,9 @@ namespace aux {
 	struct bandwidth_manager;
 	struct resolver_interface;
 	struct alert_manager;
+#ifdef TORRENT_USE_LIBCURL
+	class curl_thread_manager;
+#endif
 }
 
 	// hidden
@@ -156,6 +159,10 @@ namespace aux {
 		virtual torrent_peer_allocator_interface& get_peer_allocator() = 0;
 		virtual io_context& get_context() = 0;
 		virtual aux::resolver_interface& get_resolver() = 0;
+		
+#ifdef TORRENT_USE_LIBCURL
+		virtual curl_thread_manager* get_curl_thread_manager() = 0;
+#endif
 
 		virtual bool has_connection(peer_connection* p) const = 0;
 		virtual void insert_peer(std::shared_ptr<peer_connection> const& c) = 0;

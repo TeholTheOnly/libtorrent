@@ -1,14 +1,14 @@
 #ifndef TORRENT_MOCK_TRACKER_CLIENT_HPP
 #define TORRENT_MOCK_TRACKER_CLIENT_HPP
 
-#include "libtorrent/aux_/tracker_http_client.hpp"
+#include "libtorrent/tracker_manager.hpp"
 #include "libtorrent/deadline_timer.hpp"
 #include "libtorrent/time.hpp"
 
 namespace libtorrent { namespace aux {
 
 // Mock implementation for testing
-class TORRENT_EXTRA_EXPORT mock_tracker_client : public tracker_http_client {
+class TORRENT_EXTRA_EXPORT mock_tracker_client {
 public:
     mock_tracker_client(io_context& ios, settings_pack const& settings)
         : m_ios(ios)
@@ -16,7 +16,6 @@ public:
         , m_delay_timer(ios)
         , m_delay(milliseconds(0))
         , m_closed(false) {
-        // Set default response values
         m_response.interval = seconds(1800);
         m_response.min_interval = seconds(900);
         m_response.complete = 20;
@@ -27,7 +26,7 @@ public:
     void announce(
         tracker_request const& /*req*/,
         std::function<void(error_code const&, tracker_response const&)> handler
-    ) override {
+    ) {
         if (m_closed) {
             post(m_ios, [handler]() {
                 error_code ec;
@@ -70,21 +69,20 @@ public:
     void scrape(
         tracker_request const& req,
         std::function<void(error_code const&, tracker_response const&)> handler
-    ) override {
+    ) {
         // Reuse announce logic for scrape
         announce(req, handler);
     }
 
-    bool can_reuse() const override {
+    bool can_reuse() const {
         return !m_closed;
     }
 
-    void close() override {
+    void close() {
         m_closed = true;
         m_delay_timer.cancel();
     }
 
-    // Test helpers
     void set_mock_response(tracker_response const& resp) {
         m_response = resp;
     }

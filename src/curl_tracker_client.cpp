@@ -48,10 +48,8 @@ POSSIBILITY OF SUCH DAMAGE.
 
 namespace libtorrent { namespace aux {
 
-// Anonymous namespace for internal parsing functions that use bdecode
 namespace {
-	
-	// Helper to extract peer info from bencode
+
 	bool extract_peer_info(bdecode_node const& info, peer_entry& ret, error_code& ec)
 	{
 		if (info.type() != bdecode_node::dict_t)
@@ -86,10 +84,10 @@ namespace {
 			return false;
 		}
 		ret.port = std::uint16_t(i.int_value());
-		
+
 		return true;
 	}
-} // anonymous namespace
+}
 
 // Free function implementations (following http_tracker_connection pattern)
 tracker_response parse_announce_response(
@@ -97,17 +95,16 @@ tracker_response parse_announce_response(
 	error_code& ec)
 {
 		tracker_response resp;
-		
+
 		bdecode_node e;
 		int const res = bdecode(data.begin(), data.end(), e, ec);
-		
+
 		if (res != 0 || e.type() != bdecode_node::dict_t)
 		{
 			ec = errors::invalid_tracker_response;
 			return resp;
 		}
-		
-		// Check for failure
+
 		bdecode_node const failure = e.dict_find_string("failure reason");
 		if (failure)
 		{
@@ -115,47 +112,41 @@ tracker_response parse_announce_response(
 			ec = errors::tracker_failure;
 			return resp;
 		}
-		
-		// Check for warning
+
 		bdecode_node const warning = e.dict_find_string("warning message");
 		if (warning)
 		{
 			resp.warning_message = warning.string_value().to_string();
 		}
-		
-		// Parse interval
+
 		resp.interval = seconds32{e.dict_find_int_value("interval", 1800)};
 		resp.min_interval = seconds32{e.dict_find_int_value("min interval", 30)};
-		
-		// Parse tracker ID
+
 		bdecode_node const tracker_id = e.dict_find_string("tracker id");
 		if (tracker_id)
 		{
 			resp.trackerid = tracker_id.string_value().to_string();
 		}
-		
-		// Parse peer counts
+
 		resp.complete = int(e.dict_find_int_value("complete", -1));
 		resp.incomplete = int(e.dict_find_int_value("incomplete", -1));
-		
-		// Parse peers
+
 		bdecode_node const peers_ent = e.dict_find("peers");
 		if (peers_ent && peers_ent.type() == bdecode_node::string_t)
 		{
-			// Compact format
 			char const* peers = peers_ent.string_ptr();
 			int const len = peers_ent.string_length();
-			
+
 			if (len % 6 != 0)
 			{
 				ec = errors::invalid_tracker_response;
 				return resp;
 			}
-			
+
 			for (int i = 0; i < len; i += 6)
 			{
 				peer_entry p;
-				
+
 				p.hostname = address_v4(read_uint32(peers)).to_string();
 				p.port = read_uint16(peers);
 				resp.peers.push_back(p);
@@ -163,10 +154,9 @@ tracker_response parse_announce_response(
 		}
 		else if (peers_ent && peers_ent.type() == bdecode_node::list_t)
 		{
-			// Non-compact format
 			int const len = peers_ent.list_size();
 			resp.peers.reserve(len);
-			
+
 			for (int i = 0; i < len; ++i)
 			{
 				peer_entry p;
@@ -175,15 +165,13 @@ tracker_response parse_announce_response(
 				resp.peers.push_back(p);
 			}
 		}
-		
-		// Parse IPv6 peers if present
+
 		bdecode_node const peers6_ent = e.dict_find_string("peers6");
 		if (peers6_ent)
 		{
 			char const* peers = peers6_ent.string_ptr();
 			int const len = peers6_ent.string_length();
-			
-			// Single definitive bounds check
+
 			if (len % 18 != 0 || len < 0)
 			{
 				// Invalid IPv6 peer data - must be multiple of 18 bytes
@@ -194,33 +182,31 @@ tracker_response parse_announce_response(
 			{
 				// Pre-allocate for efficiency
 				resp.peers.reserve(resp.peers.size() + len / 18);
-				
-				// Simple, safe iteration without redundant checks
+
 				for (int i = 0; i < len; i += 18)
 				{
 					peer_entry p;
 					address_v6::bytes_type addr_bytes;
 					std::memcpy(addr_bytes.data(), peers + i, 16);
 					p.hostname = address_v6(addr_bytes).to_string();
-					
+
 					// read_uint16 expects a mutable reference to advance the pointer
 					// Create a local pointer that won't affect our iteration
 					char const* port_ptr = peers + i + 16;
 					p.port = read_uint16(port_ptr);
 					// Note: port_ptr is now advanced by 2, but we don't use it again
-					
+
 					resp.peers.push_back(std::move(p));
 				}
 			}
 		}
-		
-		// Parse external IP
+
 		bdecode_node const ip_ent = e.dict_find_string("external ip");
 		if (ip_ent)
 		{
 			char const* ip_ptr = ip_ent.string_ptr();
 			int const ip_len = ip_ent.string_length();
-			
+
 			if (ip_len == 4)
 			{
 				resp.external_ip = address_v4(read_uint32(ip_ptr));
@@ -232,7 +218,7 @@ tracker_response parse_announce_response(
 				resp.external_ip = address_v6(addr_bytes);
 			}
 		}
-		
+
 		return resp;
 	}
 
@@ -241,38 +227,35 @@ tracker_response parse_scrape_response(
 	error_code& ec)
 {
 		tracker_response resp;
-		
+
 		bdecode_node e;
 		int const res = bdecode(data.begin(), data.end(), e, ec);
-		
+
 		if (res != 0 || e.type() != bdecode_node::dict_t)
 		{
 			ec = errors::invalid_tracker_response;
 			return resp;
 		}
-		
-		// Check for failure
-		bdecode_node const failure = e.dict_find_string("failure reason");
+
+				bdecode_node const failure = e.dict_find_string("failure reason");
 		if (failure)
 		{
 			resp.failure_reason = failure.string_value().to_string();
 			ec = errors::tracker_failure;
 			return resp;
 		}
-		
-		// Parse files dict
+
 		bdecode_node const files = e.dict_find_dict("files");
 		if (!files)
 		{
 			ec = errors::invalid_tracker_response_length;
 			return resp;
 		}
-		
+
 		// We're looking for the first (and should be only) file entry
 		// The key should be the info hash we scraped for
 		if (files.dict_size() > 0)
 		{
-			// Try to find the entry for our info hash
 			// Since we don't have the actual info hash here, we'll just get the first entry
 			for (int i = 0; i < files.dict_size(); ++i)
 			{
@@ -287,7 +270,7 @@ tracker_response parse_scrape_response(
 				}
 			}
 		}
-		
+
 		return resp;
 	}
 
@@ -313,7 +296,7 @@ void curl_tracker_client::announce(
 	std::function<void(error_code const&, tracker_response const&)> handler)
 {
 	std::string url = build_announce_url(req);
-	
+
 	m_curl_thread_manager->add_request(url,
 		[this, handler](error_code const& ec, std::vector<char> const& data) {
 			if (ec) {
@@ -322,7 +305,7 @@ void curl_tracker_client::announce(
 				handler(ec, resp);
 				return;
 			}
-			
+
 			error_code parse_ec;
 			tracker_response resp = parse_announce_response(
 				span<char const>(data.data(), data.size()), parse_ec);
@@ -335,7 +318,7 @@ void curl_tracker_client::scrape(
 	std::function<void(error_code const&, tracker_response const&)> handler)
 {
 	std::string url = build_scrape_url(req);
-	
+
 	m_curl_thread_manager->add_request(url,
 		[this, handler](error_code const& ec, std::vector<char> const& data) {
 			if (ec) {
@@ -344,7 +327,7 @@ void curl_tracker_client::scrape(
 				handler(ec, resp);
 				return;
 			}
-			
+
 			error_code parse_ec;
 			tracker_response resp = parse_scrape_response(
 				span<char const>(data.data(), data.size()), parse_ec);
@@ -372,21 +355,18 @@ std::string curl_tracker_client::build_scrape_url(tracker_request const& req) co
 std::string curl_tracker_client::build_tracker_query(tracker_request const& req, bool scrape) const
 {
 	std::string query;
-	
+
 	// Pre-allocate space to avoid reallocations (optimize string building)
 	// Estimated size: info_hash(60) + peer_id(60) + numbers(100) + extras(100) = ~320 bytes
 	query.reserve(scrape ? 70 : 400);
-	
-	// Info hash (required for both announce and scrape)
+
 	query += "info_hash=";
 	query += libtorrent::escape_string({req.info_hash.data(), 20});
-	
+
 	if (scrape) {
-		// Scrape only needs info_hash
 		return query;
 	}
-	
-	// Announce parameters - build efficiently with pre-allocated buffer
+
 	query += "&peer_id=";
 	query += libtorrent::escape_string({req.pid.data(), 20});
 	query += "&port=" + std::to_string(req.listen_port);
@@ -394,8 +374,7 @@ std::string curl_tracker_client::build_tracker_query(tracker_request const& req,
 	query += "&downloaded=" + std::to_string(req.downloaded);
 	query += "&left=" + std::to_string(req.left);
 	query += "&corrupt=" + std::to_string(req.corrupt);
-	
-	// Add event if not none
+
 	if (req.event != event_t::none) {
 		// BEP-3 compliant events only (removed non-standard "paused")
 		// Only add event parameter for valid BEP-3 events (1=completed, 2=started, 3=stopped)
@@ -406,43 +385,40 @@ std::string curl_tracker_client::build_tracker_query(tracker_request const& req,
 			query += event_str[static_cast<int>(req.event)];
 		}
 	}
-	
+
 	// BEP-23: Compact Peer Lists - Request compact response format
 	query += "&compact=1";      // Prefer compact response format
 	query += "&no_peer_id=1";   // Don't need peer IDs in response
-	
-	// Optional parameters
+
 	if (req.key != 0) {
 		char key_str[20];
 		std::snprintf(key_str, sizeof(key_str), "%x", req.key);
 		query += "&key=";
 		query += key_str;
 	}
-	
+
 	query += "&numwant=" + std::to_string(req.num_want);
-	
+
 	// BEP-7: IPv6 Tracker Extension - Support both IPv4 and IPv6
 	// Add IP if specified (tracker usually knows the client IP)
 	if (!req.ipv4.empty()) {
 		query += "&ip=";
 		query += libtorrent::escape_string(req.ipv4[0].to_string());
 	}
-	
-	// IPv6 support - announce IPv6 address if available
+
 	if (!req.ipv6.empty()) {
 		query += "&ipv6=";
 		query += libtorrent::escape_string(req.ipv6[0].to_string());
 	}
-	
+
 	return query;
 }
 
 
 std::string curl_tracker_client::scrape_url_from_announce(std::string const& announce) const
 {
-	// Replace "announce" with "scrape" in the URL
 	std::string scrape_url = announce;
-	
+
 	std::size_t pos = scrape_url.rfind("/announce");
 	if (pos != std::string::npos)
 	{
@@ -450,14 +426,13 @@ std::string curl_tracker_client::scrape_url_from_announce(std::string const& ann
 	}
 	else
 	{
-		// If no announce found, just append scrape
 		pos = scrape_url.rfind('/');
 		if (pos != std::string::npos)
 		{
 			scrape_url = scrape_url.substr(0, pos) + "/scrape";
 		}
 	}
-	
+
 	return scrape_url;
 }
 

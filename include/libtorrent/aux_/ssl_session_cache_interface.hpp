@@ -37,7 +37,6 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <string>
 
 #ifdef TORRENT_USE_OPENSSL
-// Forward declaration
 typedef struct ssl_session_st SSL_SESSION;
 #endif
 
@@ -50,13 +49,11 @@ public:
 	virtual ~ssl_session_cache_interface() = default;
 	
 #ifdef TORRENT_USE_OPENSSL
-	// Store an SSL session for a hostname (takes ownership)
+	// Takes ownership
 	virtual void store_ssl_session(std::string const& hostname, SSL_SESSION* session) = 0;
 	
-	// Retrieve a cached SSL session for a hostname
 	virtual SSL_SESSION* get_cached_ssl_session(std::string const& hostname) const = 0;
 	
-	// Remove a specific SSL session
 	virtual void remove_ssl_session(SSL_SESSION* session) = 0;
 #endif
 };

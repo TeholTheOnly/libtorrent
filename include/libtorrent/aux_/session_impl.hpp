@@ -423,6 +423,11 @@ namespace aux {
 
 			io_context& get_context() override { return m_io_context; }
 			resolver_interface& get_resolver() override { return m_host_resolver; }
+			
+#ifdef TORRENT_USE_LIBCURL
+			curl_thread_manager* get_curl_thread_manager() override 
+			{ return m_curl_thread_manager.get(); }
+#endif
 
 			aux::vector<torrent*>& torrent_list(torrent_list_index_t i) override
 			{
@@ -970,7 +975,6 @@ namespace aux {
 			resolver m_host_resolver;
 
 #ifdef TORRENT_USE_LIBCURL
-			// shared curl thread manager for all tracker requests
 			std::shared_ptr<curl_thread_manager> m_curl_thread_manager;
 #endif
 

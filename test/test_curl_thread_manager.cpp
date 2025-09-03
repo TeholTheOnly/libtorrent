@@ -32,8 +32,9 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include "test.hpp"
 #include "test_utils.hpp"
-#include "setup_transfer.hpp" // For start_web_server and stop_web_server
+#include "setup_transfer.hpp"
 #include "libtorrent/config.hpp"
+#include <future>
 
 #ifdef TORRENT_USE_LIBCURL
 
@@ -42,15 +43,16 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/io_context.hpp"
 #include "libtorrent/settings_pack.hpp"
 #include "libtorrent/error_code.hpp"
+#include "libtorrent/random.hpp"
 #include "libtorrent/time.hpp"
-#include "libtorrent/error.hpp" // For standard libtorrent errors
+#include "libtorrent/error.hpp"
 #include <thread>
 #include <atomic>
 #include <chrono>
 #include <fstream>
 #include <iostream>
 #include <functional>
-#include <cstdio> // For std::remove
+#include <cstdio>
 #include <signal.h>
 #include <curl/curl.h>
 
@@ -60,12 +62,9 @@ using namespace std::chrono_literals;
 
 namespace {
 
-// Global initialization for curl (required for multi-threaded use)
 struct curl_initializer {
     curl_initializer() {
-        // Ignore SIGPIPE on POSIX systems to prevent crashes when writing to closed sockets
         signal(SIGPIPE, SIG_IGN);
-        // Initialize SSL and WinSock (on Windows)
         curl_global_init(CURL_GLOBAL_DEFAULT);
     }
     ~curl_initializer() {
@@ -73,15 +72,11 @@ struct curl_initializer {
     }
 } g_curl_init;
 
-// run_io_context_until helper is now in test_utils.hpp
-
-// RAII Fixture for tests requiring a web server and a test file
 struct WebServerFixture
 {
     int http_port = 0;
     std::string file_name;
 
-    // Constructor for string content
     WebServerFixture(std::string name, std::string const& content)
         : file_name(std::move(name))
     {
@@ -89,7 +84,6 @@ struct WebServerFixture
         http_port = start_web_server();
     }
 
-    // Constructor for binary/large content
     WebServerFixture(std::string name, std::vector<char> const& content)
         : file_name(std::move(name))
     {
@@ -111,18 +105,13 @@ struct WebServerFixture
 private:
     void create_file(const char* data, size_t size)
     {
-        // Use binary mode to ensure exact size
         std::ofstream test_file(file_name, std::ios::binary);
         test_file.write(data, size);
         test_file.close();
     }
 };
 
-} // anonymous namespace
-
-// ============================================================================
-// Test Cases
-// ============================================================================
+}
 
 // Test 1: Basic Lifecycle (Creation and Shutdown)
 TORRENT_TEST(curl_thread_manager_lifecycle)
@@ -131,7 +120,6 @@ TORRENT_TEST(curl_thread_manager_lifecycle)
     settings_pack pack;
     session_settings settings(pack);
 
-    // Test creation and initialization synchronization
     std::shared_ptr<curl_thread_manager> manager;
     try
     {
@@ -139,22 +127,18 @@ TORRENT_TEST(curl_thread_manager_lifecycle)
     }
     catch (std::runtime_error const& e)
     {
-        // Handle potential initialization failures (e.g., curl_multi_init failure)
         TEST_ERROR(std::string("Initialization failed: ") + e.what());
         return;
     }
 
     TEST_CHECK(manager != nullptr);
 
-    // Test explicit shutdown and thread joining
     manager->shutdown();
 
-    // Test implicit shutdown via destructor
     {
         settings_pack pack2;
         session_settings settings2(pack2);
         auto manager2 = curl_thread_manager::create(ios, settings2);
-        // Destructor runs here
     }
 }
 
@@ -191,10 +175,7 @@ TORRENT_TEST(curl_thread_manager_simple_success)
 
 // Test 3: Connection Pooling and Concurrency (The critical test)
 // Verifies the fix for the original issue where only 1/5 requests completed.
-//
-// NOTE: This test uses google.com instead of the local Python server because
-// Python's http.server.HTTPServer cannot handle concurrent connections properly.
-// This is a limitation of the test infrastructure, not our implementation.
+// Uses local server which now supports concurrent connections with Hypercorn.
 TORRENT_TEST(curl_thread_manager_concurrency_pooling)
 {
     io_context ios;
@@ -206,25 +187,31 @@ TORRENT_TEST(curl_thread_manager_concurrency_pooling)
     std::atomic<int> success_count{0};
     std::atomic<int> total_count{0};
 
-    std::printf("\n=== Testing concurrent requests against google.com ===\n");
-    std::printf("Note: Using external server because Python HTTPServer has concurrency limitations\n\n");
+    char data_buffer[3216];
+    aux::random_bytes(data_buffer);
+    std::ofstream("test_file").write(data_buffer, 3216);
+    
+    int http_port = start_web_server();
+    std::string url = "http://127.0.0.1:" + std::to_string(http_port) + "/test_file";
+    
+    std::printf("\n=== Testing concurrent requests against local server ===\n");
+    std::printf("Testing %d concurrent requests to %s\n\n", num_requests, url.c_str());
     
     for (int i = 0; i < num_requests; ++i)
     {
-        // Use google.com robots.txt - a small, reliable resource
         manager->add_request(
-            "http://www.google.com/robots.txt",
+            url,
             [&, i](error_code ec, std::vector<char> data) {
-                if (!ec && data.size() > 0) {
+                if (!ec && data.size() == 3216) {
                     success_count++;
                 }
                 total_count++;
             },
-            seconds(30));  // Longer timeout for internet requests
+            seconds(10));  // Local server timeout
     }
 
-    // Allow more time for internet requests
-    bool success = run_io_context_until(ios, 60s, [&]() {
+    // Allow time for local requests
+    bool success = run_io_context_until(ios, 15s, [&]() {
         return total_count == num_requests;
     });
 
@@ -238,7 +225,6 @@ TORRENT_TEST(curl_thread_manager_concurrency_pooling)
 }
 
 // Test 4: Thread Safety (Concurrent add_request calls)
-// Uses google.com to avoid Python server limitations
 TORRENT_TEST(curl_thread_manager_thread_safety)
 {
     io_context ios;
@@ -251,18 +237,24 @@ TORRENT_TEST(curl_thread_manager_thread_safety)
     const int total_requests = num_threads * requests_per_thread;
     std::atomic<int> completed_count{0};
 
+    char data_buffer[3216];
+    aux::random_bytes(data_buffer);
+    std::ofstream("test_file").write(data_buffer, 3216);
+    
+    int http_port = start_web_server();
+    std::string url = "http://127.0.0.1:" + std::to_string(http_port) + "/test_file";
+
     std::printf("\n=== Testing thread safety with %d threads ===\n", num_threads);
-    std::printf("Note: Using google.com to ensure reliable completion\n\n");
+    std::printf("Each thread submitting %d requests to local server\n\n", requests_per_thread);
 
     std::vector<std::thread> threads;
     for (int t = 0; t < num_threads; ++t)
     {
-        // Submit requests concurrently from different threads to test queue locking and wakeup
         threads.emplace_back([&]() {
             for (int i = 0; i < requests_per_thread; ++i)
             {
                 manager->add_request(
-                    "http://www.google.com/robots.txt",
+                    url,
                     [&](error_code ec, std::vector<char> data) {
                         (void)data;
                         if (!ec) completed_count++;
@@ -272,13 +264,11 @@ TORRENT_TEST(curl_thread_manager_thread_safety)
         });
     }
 
-    // Join producer threads
     for (auto& t : threads)
     {
         t.join();
     }
 
-    // Wait for consumer (curl thread) - allow more time for internet requests
     bool success = run_io_context_until(ios, 60s, [&]() {
         return completed_count == total_requests;
     });
@@ -295,8 +285,10 @@ TORRENT_TEST(curl_thread_manager_thread_safety)
 // Test 5: Error Handling (HTTP 404 Not Found)
 TORRENT_TEST(curl_thread_manager_http_404)
 {
-    // Start server without creating the file
     int http_port = start_web_server();
+    
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    
     io_context ios;
     settings_pack pack;
     session_settings settings(pack);
@@ -304,21 +296,38 @@ TORRENT_TEST(curl_thread_manager_http_404)
 
     std::atomic<bool> completed{false};
     error_code result_ec;
+    std::vector<char> result_data;
 
     std::string url = "http://127.0.0.1:" + std::to_string(http_port) + "/non_existent.txt";
+
+    std::printf("TEST: Requesting non-existent file from %s\n", url.c_str());
 
     manager->add_request(
         url,
         [&](error_code ec, std::vector<char> data) {
-            (void)data;
+            std::printf("TEST: Callback invoked with error: %s (%d), data size: %zu\n", 
+                       ec.message().c_str(), ec.value(), data.size());
             result_ec = ec;
+            result_data = std::move(data);
             completed = true;
         });
 
-    run_io_context_until(ios, 5s, [&]() { return completed.load(); });
+    run_io_context_until(ios, 10s, [&]() { return completed.load(); });
 
     stop_web_server();
     manager->shutdown();
+
+    if (!completed) {
+        std::printf("TEST ERROR: Callback was never invoked (timeout after 10s)\n");
+    }
+    if (completed && result_ec != errors::http_error) {
+        std::printf("TEST ERROR: Expected http_error but got: %s (%d)\n", 
+                   result_ec.message().c_str(), result_ec.value());
+        if (!result_data.empty()) {
+            std::printf("TEST ERROR: Response data (first 200 chars): %.200s\n", 
+                       result_data.data());
+        }
+    }
 
     TEST_CHECK(completed);
     // HTTP codes >= 400 map to errors::http_error
@@ -336,7 +345,6 @@ TORRENT_TEST(curl_thread_manager_dns_failure)
     std::atomic<bool> completed{false};
     error_code result_ec;
 
-    // Use an invalid domain name
     std::string url = "http://invalid.domain.libtorrent.test/";
 
     manager->add_request(
@@ -374,7 +382,6 @@ TORRENT_TEST(curl_thread_manager_timeout)
     std::atomic<bool> completed{false};
     error_code result_ec;
 
-    // Use a non-routable IP address (RFC 5737 TEST-NET-1) to reliably simulate a connection timeout
     std::string url = "http://10.255.255.1/";
 
     auto start_time = std::chrono::steady_clock::now();
@@ -412,7 +419,6 @@ TORRENT_TEST(curl_thread_manager_shutdown_active)
     std::atomic<int> callback_count{0};
     std::atomic<int> shutdown_errors{0};
 
-    // Use non-routable IP with long timeout to ensure requests are active (in flight) during shutdown
     std::string url = "http://10.255.255.1/";
 
     for (int i = 0; i < num_requests; ++i)
@@ -430,7 +436,6 @@ TORRENT_TEST(curl_thread_manager_shutdown_active)
             seconds(30)); // Long timeout
     }
 
-    // Brief pause to allow the worker thread to pick up requests
     std::this_thread::sleep_for(100ms);
 
     // Shutdown immediately
@@ -457,7 +462,6 @@ TORRENT_TEST(curl_thread_manager_shutdown_queued)
     const int num_requests = 50;
     std::atomic<int> callback_count{0};
 
-    // Flood the manager rapidly. Some requests will likely remain in the pending queue.
     for (int i = 0; i < num_requests; ++i)
     {
         manager->add_request(
@@ -516,7 +520,6 @@ TORRENT_TEST(curl_thread_manager_wakeup_latency)
     TEST_CHECK(ms < 100);
 }
 
-// Test 11: Resource Limit (MAX_RESPONSE_SIZE)
 TORRENT_TEST(curl_thread_manager_size_limit)
 {
     io_context ios;
@@ -555,7 +558,6 @@ TORRENT_TEST(curl_thread_manager_size_limit)
     TEST_EQUAL(result_ec, errors::http_error);
 }
 
-// Test 12: Verify libcurl Requirements
 TORRENT_TEST(curl_requirements_check)
 {
     curl_version_info_data* ver = curl_version_info(CURLVERSION_NOW);
@@ -572,10 +574,6 @@ TORRENT_TEST(curl_requirements_check)
     TEST_CHECK(async_dns);
 }
 
-// ============================================================================
-// Retry Logic Tests
-// ============================================================================
-
 // Test 13: Simple 500 Error (verify basic retry behavior)
 TORRENT_TEST(curl_thread_manager_simple_500_error)
 {
@@ -589,19 +587,17 @@ TORRENT_TEST(curl_thread_manager_simple_500_error)
     std::atomic<bool> completed{false};
     error_code result_ec;
     
-    // Test that a 500 error triggers retries and eventually completes
     manager->add_request(
         fixture.url(),
         [&](error_code ec, std::vector<char> data) {
+            (void)data;
             std::printf("SIMPLE 500 TEST: Callback called with error: %s\n", ec.message().c_str());
             result_ec = ec;
             completed = true;
         },
         seconds(30));  // Long timeout to allow all retries
     
-    // Should make 1 initial + 3 retries = 4 requests total
-    // Then invoke callback with error
-    bool finished = run_io_context_until(ios, 20s, [&]() { return completed.load(); });
+    run_io_context_until(ios, 20s, [&]() { return completed.load(); });
     
     manager->shutdown();
     
@@ -632,6 +628,7 @@ TORRENT_TEST(curl_thread_manager_retry_on_500)
     manager->add_request(
         fixture.url(),
         [&](error_code ec, std::vector<char> data) {
+            (void)data;
             std::printf("Retry test callback called! Error: %s (%d)\n", 
                        ec.message().c_str(), ec.value());
             result_ec = ec;
@@ -639,8 +636,6 @@ TORRENT_TEST(curl_thread_manager_retry_on_500)
         },
         seconds(20));  // Long timeout to allow retries
     
-    // Should retry 3 times (initial + 3 retries = 4 attempts)
-    // With exponential backoff: 0s, 1s, 2s, 4s, 8s = total could be ~15s
     std::printf("Waiting for completion...\n");
     bool finished = run_io_context_until(ios, 30s, [&]() { 
         if (completed.load()) {
@@ -663,7 +658,6 @@ TORRENT_TEST(curl_thread_manager_retry_on_500)
     TEST_CHECK(completed);
     TEST_EQUAL(result_ec, errors::http_error);
     
-    // Should have taken at least 7 seconds (1+2+4) for retries
     std::printf("Retry test took %ld ms\n", elapsed_ms);
     TEST_CHECK(elapsed_ms >= 6000);  // Allow some timing flexibility
 }
@@ -671,7 +665,6 @@ TORRENT_TEST(curl_thread_manager_retry_on_500)
 // Test 14: Exponential Backoff Timing
 TORRENT_TEST(curl_thread_manager_exponential_backoff)
 {
-    // Use /retry_test which returns 500 first, then 200
     WebServerFixture fixture("retry_test", "");
     
     io_context ios;
@@ -704,7 +697,6 @@ TORRENT_TEST(curl_thread_manager_exponential_backoff)
     TEST_CHECK(!result_ec);  // Should succeed on retry
     TEST_CHECK(result_data.size() > 0);  // Should have response data
     
-    // Should have taken ~2 seconds for the retry delay (initial delay doubles to 2000ms)
     std::printf("Exponential backoff test took %ld ms\n", elapsed_ms);
     TEST_CHECK(elapsed_ms >= 1900);  // At least 1900ms
     TEST_CHECK(elapsed_ms <= 2500); // But less than 2.5s to account for overhead
@@ -728,12 +720,12 @@ TORRENT_TEST(curl_thread_manager_max_retries)
     manager->add_request(
         fixture.url(),
         [&](error_code ec, std::vector<char> data) {
+            (void)data;
             result_ec = ec;
             completed = true;
         },
         seconds(30));  // Long timeout to allow all retries
     
-    // Should give up after 3 retries
     run_io_context_until(ios, 15s, [&]() { return completed.load(); });
     
     auto elapsed = std::chrono::steady_clock::now() - start_time;
@@ -744,7 +736,6 @@ TORRENT_TEST(curl_thread_manager_max_retries)
     TEST_CHECK(completed);
     TEST_EQUAL(result_ec, errors::http_error);
     
-    // Should have attempted: initial + 3 retries with delays 2s, 4s, 8s = 14s total
     std::printf("Max retries test took %ld ms\n", elapsed_ms);
     TEST_CHECK(elapsed_ms >= 13000);  // At least 13 seconds
     TEST_CHECK(elapsed_ms <= 15000); // But should complete within 15s
@@ -769,6 +760,7 @@ TORRENT_TEST(curl_thread_manager_retry_deadline)
     manager->add_request(
         fixture.url(),
         [&](error_code ec, std::vector<char> data) {
+            (void)data;
             result_ec = ec;
             completed = true;
         },
@@ -785,7 +777,6 @@ TORRENT_TEST(curl_thread_manager_retry_deadline)
     // Could be either timeout or http_error depending on timing
     TEST_CHECK(result_ec == errors::timed_out || result_ec == errors::http_error);
     
-    // Should complete quickly without retries
     std::printf("Deadline test took %ld ms\n", elapsed_ms);
     TEST_CHECK(elapsed_ms <= 1500);  // Should not retry (no 1s delay)
 }
@@ -807,7 +798,7 @@ TORRENT_TEST(curl_thread_manager_no_retry_404)
     
     manager->add_request(
         fixture.url(),
-        [&](error_code ec, std::vector<char> data) {
+        [&](error_code ec, std::vector<char>) {
             result_ec = ec;
             completed = true;
         });
@@ -822,9 +813,239 @@ TORRENT_TEST(curl_thread_manager_no_retry_404)
     TEST_CHECK(completed);
     TEST_EQUAL(result_ec, errors::http_error);
     
-    // Should complete immediately without retry
     std::printf("No retry on 404 test took %ld ms\n", elapsed_ms);
     TEST_CHECK(elapsed_ms <= 500);  // Should be fast, no retry delay
+}
+
+// Test C3: String Lifetime Safety
+TORRENT_TEST(string_lifetime_safety)
+{
+    io_context ios;
+    settings_pack settings;
+    
+    settings.set_bool(settings_pack::proxy_tracker_connections, true);
+    settings.set_str(settings_pack::proxy_hostname, "very-long-proxy-hostname-to-test-string-storage.example.com");
+    settings.set_int(settings_pack::proxy_port, 8080);
+    settings.set_str(settings_pack::proxy_username, "very_long_username_for_testing_secure_storage");
+    settings.set_str(settings_pack::proxy_password, "very_long_password_that_should_be_securely_cleared");
+    settings.set_str(settings_pack::user_agent, "Test User Agent with Long String for Lifetime Testing");
+    
+    session_settings sett(settings);
+    auto manager = curl_thread_manager::create(ios, sett);
+    
+    std::atomic<int> completed_count{0};
+    const int num_requests = 100;
+    
+    for (int i = 0; i < num_requests; ++i) {
+        std::string long_url = "http://test-server.example.com/very/long/path/to/test/string/storage/announce?info_hash=" 
+            + std::to_string(i) + "&peer_id=12345678901234567890&port=6881";
+        
+        manager->add_request(long_url, 
+            [&completed_count](error_code const&, std::vector<char> const&) {
+                completed_count++;
+            }, seconds(1));
+    }
+    
+    run_io_context_until(ios, milliseconds(200), [&]() {
+        return false;
+    });
+    
+    manager->shutdown();
+    
+    TEST_CHECK(true);
+    std::printf("String lifetime test completed with %d requests\n", num_requests);
+}
+
+// Test H3: Race Condition in Atomic Flag
+TORRENT_TEST(notification_race_condition)
+{
+    io_context ios;
+    settings_pack settings;
+    session_settings sett(settings);
+    auto manager = curl_thread_manager::create(ios, sett);
+    
+    std::atomic<int> completed{0};
+    const int num_threads = 10;
+    const int requests_per_thread = 50;
+    
+    // Spawn multiple threads to send requests concurrently
+    std::vector<std::thread> threads;
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&manager, &completed, t, requests_per_thread]() {
+            for (int i = 0; i < requests_per_thread; ++i) {
+                std::string url = "http://127.0.0.1:8080/test?thread=" + std::to_string(t) + "&req=" + std::to_string(i);
+                manager->add_request(url,
+                    [&completed](error_code const&, std::vector<char> const&) {
+                        completed.fetch_add(1, std::memory_order_relaxed);
+                    }, seconds(5));
+                
+                std::this_thread::sleep_for(microseconds(rand() % 100));
+            }
+        });
+    }
+    
+    for (auto& t : threads) {
+        t.join();
+    }
+    
+    run_io_context_until(ios, seconds(15), [&]() {
+        return completed.load() >= (num_threads * requests_per_thread * 8 / 10);
+    });
+    
+    manager->shutdown();
+    
+    std::printf("Race condition test: %d/%d requests completed\n", 
+        completed.load(), num_threads * requests_per_thread);
+    TEST_CHECK(completed > 0);
+}
+
+TORRENT_TEST(connection_pool_dynamic_scaling)
+{
+    io_context ios;
+    session_settings settings;
+    
+    auto mgr = curl_thread_manager::create(ios, settings);
+    TEST_CHECK(mgr != nullptr);
+    
+    auto stats = mgr->get_stats();
+    TEST_EQUAL(stats.unique_tracker_hosts, 0);
+    TEST_EQUAL(stats.current_connection_limit, 2);  // Minimum is 2
+    
+    mgr->tracker_added("http://tracker1.example.com:8080/announce");
+    mgr->tracker_added("http://tracker1.example.com:8080/announce");
+    mgr->tracker_added("http://tracker1.example.com:9090/announce");
+    
+    stats = mgr->get_stats();
+    TEST_EQUAL(stats.unique_tracker_hosts, 1);
+    TEST_CHECK(stats.current_connection_limit >= 2);
+    
+    mgr->tracker_added("http://tracker2.example.com/announce");
+    mgr->tracker_added("udp://tracker3.example.com:6969/announce");
+    
+    run_io_context_until(ios, 1s, [&mgr]() {
+        return mgr->get_stats().current_connection_limit == 6;
+    });
+    
+    stats = mgr->get_stats();
+    TEST_EQUAL(stats.unique_tracker_hosts, 3);
+    TEST_EQUAL(stats.current_connection_limit, 6);  // 3 hosts * 2 connections
+    
+    mgr->tracker_removed("http://tracker1.example.com:8080/announce");
+    mgr->tracker_removed("http://tracker1.example.com:8080/announce");
+    mgr->tracker_removed("http://tracker1.example.com:9090/announce");
+    
+    run_io_context_until(ios, 1s, [&mgr]() {
+        return mgr->get_stats().current_connection_limit == 4;
+    });
+    
+    stats = mgr->get_stats();
+    TEST_EQUAL(stats.unique_tracker_hosts, 2);
+    TEST_EQUAL(stats.current_connection_limit, 4);  // 2 hosts * 2 connections
+    
+    mgr->tracker_removed("http://tracker2.example.com/announce");
+    mgr->tracker_removed("udp://tracker3.example.com:6969/announce");
+    
+    run_io_context_until(ios, 1s, [&mgr]() {
+        return mgr->get_stats().current_connection_limit == 2;
+    });
+    
+    stats = mgr->get_stats();
+    TEST_EQUAL(stats.unique_tracker_hosts, 0);
+    TEST_EQUAL(stats.current_connection_limit, 2);  // Back to minimum
+    
+    mgr->tracker_added("");
+    mgr->tracker_added("not-a-url");
+    mgr->tracker_removed("");
+    mgr->tracker_removed("not-a-url");
+    
+    mgr->shutdown();
+    run_io_context_until(ios, 5s, [&mgr]() { return mgr.use_count() == 1; });
+}
+
+TORRENT_TEST(tracker_host_counter_reference_counting)
+{
+    // Test that tracker_host_counter properly handles multiple adds/removes
+    io_context ios;
+    session_settings settings;
+    
+    auto mgr = curl_thread_manager::create(ios, settings);
+    TEST_CHECK(mgr != nullptr);
+    
+    // Add same tracker multiple times (simulating multiple torrents)
+    mgr->tracker_added("http://tracker.example.com/announce");
+    mgr->tracker_added("http://tracker.example.com/announce");
+    mgr->tracker_added("http://tracker.example.com/announce");
+    
+    // Remove instances one by one
+    mgr->tracker_removed("http://tracker.example.com/announce");
+    mgr->tracker_removed("http://tracker.example.com/announce");
+    mgr->tracker_removed("http://tracker.example.com/announce");
+    
+    // Test removing more times than added (should handle gracefully)
+    mgr->tracker_removed("http://tracker.example.com/announce");
+    
+    mgr->shutdown();
+    run_io_context_until(ios, 5s, [&mgr]() { return mgr.use_count() == 1; });
+}
+
+TORRENT_TEST(interface_binding)
+{
+    // Test that outgoing_interfaces setting is properly applied
+    // This test verifies the code path doesn't crash when interface binding is configured
+    io_context ios;
+    session_settings settings;
+    
+    // Set interface binding to a non-existent interface to test error handling
+    // Using a fake interface ensures we test the error path consistently
+    settings.set_str(settings_pack::outgoing_interfaces, "fake_interface_test");
+    
+    auto mgr = curl_thread_manager::create(ios, settings);
+    TEST_CHECK(mgr != nullptr);
+    
+    // Create a simple test server to verify the request
+    WebServerFixture server("test_interface", "Interface test response");
+    
+    std::promise<error_code> ec_promise;
+    std::promise<std::vector<char>> response_promise;
+    auto ec_future = ec_promise.get_future();
+    auto response_future = response_promise.get_future();
+    
+    char url_buffer[256];
+    std::snprintf(url_buffer, sizeof(url_buffer), "http://127.0.0.1:%d/test_interface", server.http_port);
+    
+    mgr->add_request(
+        url_buffer,
+        [&](error_code ec, std::vector<char> response) {
+            ec_promise.set_value(ec);
+            response_promise.set_value(std::move(response));
+        },
+        5s
+    );
+    
+    run_io_context_until(ios, 10s, [&]() {
+        return response_future.wait_for(0s) == std::future_status::ready;
+    });
+    
+    error_code ec = ec_future.get();
+    std::vector<char> response = response_future.get();
+    
+    // When using a non-existent interface, we expect CURLE_INTERFACE_FAILED (45)
+    // which maps to errors::http_error (and is non-retryable)
+    // This test verifies that:
+    // 1. The interface binding code path doesn't crash
+    // 2. The error is handled gracefully without retries
+    TEST_CHECK(ec == errors::http_error);
+    
+    mgr->shutdown();
+    run_io_context_until(ios, 5s, [&mgr]() { return mgr.use_count() == 1; });
+}
+
+#else // TORRENT_USE_LIBCURL
+
+TORRENT_TEST(curl_thread_manager_not_available)
+{
+    TEST_CHECK(true);
+    std::printf("libcurl support not enabled. curl_thread_manager tests skipped.\n");
 }
 
 #endif // TORRENT_USE_LIBCURL

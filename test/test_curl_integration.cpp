@@ -45,41 +45,48 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "setup_transfer.hpp"
 #include <chrono>
 #include <thread>
+#include <sstream>
 
 using namespace lt;
 
-// Test 1: Basic libcurl integration
 TORRENT_TEST(curl_integration_basic)
 {
+	int const port = start_web_server(false);
+	
 	settings_pack settings;
 	settings.set_bool(settings_pack::enable_http2_trackers, true);
 	settings.set_int(settings_pack::alert_mask, alert_category::all);
 	
 	lt::session ses(settings);
 	
-	// Verify setting is applied
 	auto current = ses.get_settings();
 	TEST_CHECK(current.get_bool(settings_pack::enable_http2_trackers));
 	
-	// Add torrent with HTTP tracker
+	std::stringstream tracker_url;
+	tracker_url << "http://127.0.0.1:" << port << "/announce";
 	add_torrent_params p = parse_magnet_uri(
 		"magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
-		"&tr=http://tracker.opentrackr.org:1337/announce");
+		"&tr=" + tracker_url.str());
 	p.save_path = ".";
 	
 	torrent_handle h = ses.add_torrent(p);
 	TEST_CHECK(h.is_valid());
+	
+	stop_web_server();
 }
 
-// Test 2: HTTP/1.1 connection reuse fix
 TORRENT_TEST(curl_fixes_connection_reuse)
 {
+	int const port = start_web_server(false);
+	
 	settings_pack settings;
 	settings.set_bool(settings_pack::enable_http2_trackers, true);
 	
 	lt::session ses(settings);
 	
-	// Add multiple torrents to same tracker
+	std::stringstream tracker_url;
+	tracker_url << "http://127.0.0.1:" << port << "/announce";
+	
 	std::vector<torrent_handle> handles;
 	for (int i = 0; i < 5; ++i)
 	{
@@ -89,65 +96,77 @@ TORRENT_TEST(curl_fixes_connection_reuse)
 		
 		add_torrent_params p = parse_magnet_uri(
 			"magnet:?xt=urn:btih:" + info_hash +
-			"&tr=http://tracker.opentrackr.org:1337/announce");
+			"&tr=" + tracker_url.str());
 		p.save_path = ".";
 		handles.push_back(ses.add_torrent(p));
 	}
 	
-	// All should remain valid (no FD exhaustion)
+	// No FD exhaustion
 	for (auto& h : handles)
 	{
 		TEST_CHECK(h.is_valid());
 	}
+	
+	stop_web_server();
 }
 
-// Test 3: HTTPS tracker support (would use HTTP/2 if available)
 TORRENT_TEST(curl_https_tracker)
 {
-	settings_pack settings;
+	// Start local web server with SSL (enables HTTP/2)
+	int const port = start_web_server(true);
+	
+	// Setup HTTPS test settings with CA certificate
+	settings_pack settings = setup_https_test_settings();
 	settings.set_bool(settings_pack::enable_http2_trackers, true);
+	settings.set_int(settings_pack::alert_mask, alert_category::all);
 	
 	lt::session ses(settings);
 	
 	// Use HTTPS tracker
+	std::stringstream tracker_url;
+	tracker_url << "https://127.0.0.1:" << port << "/announce";
 	add_torrent_params p = parse_magnet_uri(
 		"magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
-		"&tr=https://tracker.example.com/announce");
+		"&tr=" + tracker_url.str());
 	p.save_path = ".";
 	
 	torrent_handle h = ses.add_torrent(p);
 	TEST_CHECK(h.is_valid());
 	
-	// Force announce
 	h.force_reannounce();
 	
-	// Should not crash or fail
 	std::this_thread::sleep_for(std::chrono::seconds(1));
 	TEST_CHECK(h.is_valid());
+	
+	stop_web_server();
 }
 
-// Test 4: Automatic HTTP/2 to HTTP/1.1 fallback
 TORRENT_TEST(curl_http2_fallback)
 {
+	// Start local web server without SSL (HTTP/1.1 only)
+	int const port = start_web_server(false);
+	
 	settings_pack settings;
 	settings.set_bool(settings_pack::enable_http2_trackers, true);
 	
 	lt::session ses(settings);
 	
 	// HTTP tracker (no HTTP/2 on cleartext)
+	std::stringstream tracker_url;
+	tracker_url << "http://127.0.0.1:" << port << "/announce";
 	add_torrent_params p = parse_magnet_uri(
 		"magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
-		"&tr=http://tracker.example.com/announce");
+		"&tr=" + tracker_url.str());
 	p.save_path = ".";
 	
 	torrent_handle h = ses.add_torrent(p);
 	h.force_reannounce();
 	
-	// Should work with automatic fallback
 	TEST_CHECK(h.is_valid());
+	
+	stop_web_server();
 }
 
-// Test 5: Timeout handling
 TORRENT_TEST(curl_timeout_handling)
 {
 	settings_pack settings;
@@ -188,12 +207,10 @@ TORRENT_TEST(curl_timeout_handling)
 	
 	auto duration = std::chrono::steady_clock::now() - start;
 	
-	// Should timeout within reasonable time
 	TEST_CHECK(duration < std::chrono::seconds(10));
 	TEST_CHECK(got_error);
 }
 
-// Test 6: Runtime settings changes
 TORRENT_TEST(curl_runtime_settings)
 {
 	settings_pack settings;
@@ -208,14 +225,12 @@ TORRENT_TEST(curl_runtime_settings)
 	
 	torrent_handle h = ses.add_torrent(p);
 	
-	// Disable HTTP/2 at runtime
 	settings.set_bool(settings_pack::enable_http2_trackers, false);
 	ses.apply_settings(settings);
 	
 	h.force_reannounce();
 	TEST_CHECK(h.is_valid());
 	
-	// Re-enable HTTP/2
 	settings.set_bool(settings_pack::enable_http2_trackers, true);
 	ses.apply_settings(settings);
 	
@@ -223,7 +238,6 @@ TORRENT_TEST(curl_runtime_settings)
 	TEST_CHECK(h.is_valid());
 }
 
-// Test 7: Multiple trackers per torrent
 TORRENT_TEST(curl_multiple_trackers)
 {
 	settings_pack settings;
@@ -231,7 +245,6 @@ TORRENT_TEST(curl_multiple_trackers)
 	
 	lt::session ses(settings);
 	
-	// Multiple trackers (HTTP and HTTPS)
 	add_torrent_params p = parse_magnet_uri(
 		"magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
 		"&tr=http://tracker1.example.com/announce"
@@ -242,14 +255,12 @@ TORRENT_TEST(curl_multiple_trackers)
 	torrent_handle h = ses.add_torrent(p);
 	TEST_CHECK(h.is_valid());
 	
-	// Force announce to all trackers
 	h.force_reannounce(0, -1, torrent_handle::ignore_min_interval);
 	
 	std::this_thread::sleep_for(std::chrono::seconds(2));
 	TEST_CHECK(h.is_valid());
 }
 
-// Test 8: High volume stress test
 TORRENT_TEST(curl_high_volume)
 {
 	settings_pack settings;
@@ -258,7 +269,6 @@ TORRENT_TEST(curl_high_volume)
 	
 	lt::session ses(settings);
 	
-	// Add 100 torrents
 	std::vector<torrent_handle> handles;
 	for (int i = 0; i < 100; ++i)
 	{
@@ -276,7 +286,6 @@ TORRENT_TEST(curl_high_volume)
 		handles.push_back(ses.add_torrent(p));
 	}
 	
-	// Force all announces
 	for (auto& h : handles)
 	{
 		h.force_reannounce();
@@ -284,7 +293,7 @@ TORRENT_TEST(curl_high_volume)
 	
 	std::this_thread::sleep_for(std::chrono::seconds(5));
 	
-	// All should remain valid (no resource exhaustion)
+	// No resource exhaustion
 	int valid_count = 0;
 	for (auto& h : handles)
 	{
@@ -295,10 +304,9 @@ TORRENT_TEST(curl_high_volume)
 
 #else // TORRENT_USE_LIBCURL
 
-// Dummy test when libcurl is not available
 TORRENT_TEST(curl_not_available)
 {
-	TEST_CHECK(true); // Just pass
+	TEST_CHECK(true);
 }
 
 #endif // TORRENT_USE_LIBCURL

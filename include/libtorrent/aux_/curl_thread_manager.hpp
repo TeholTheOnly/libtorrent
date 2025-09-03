@@ -56,6 +56,14 @@ POSSIBILITY OF SUCH DAMAGE.
 
 namespace libtorrent { namespace aux {
 
+// Statistics for monitoring curl thread manager
+struct curl_thread_stats {
+    std::size_t unique_tracker_hosts;     // Number of unique tracker hostnames
+    long current_connection_limit;        // Current max connections setting
+    std::size_t active_requests;          // Currently processing requests
+    std::size_t queued_requests;          // Requests waiting to be processed
+};
+
 // Structure to hold response buffer and size limit for write_callback
 // This must be heap-allocated (e.g., via shared_ptr) because the curl_request
 // object containing it might be moved after its address is passed to libcurl.
@@ -67,16 +75,14 @@ struct response_data {
 // Request wrapper for thread communication
 struct curl_request {
     std::string url;
-    // Updated to use shared_ptr<response_data> for dynamic size limiting and memory safety
     std::shared_ptr<response_data> response;
     std::function<void(error_code, std::vector<char>)> completion_handler;
-    time_point deadline;  // Absolute deadline
+    time_point deadline;
     int retry_count = 0;
     int max_retries = 3;
     milliseconds retry_delay{1000};  // Initial retry delay (exponential backoff)
 };
 
-// Forward declaration for curl_transfer_data
 struct curl_transfer_data;
 
 // RAII context for request lifetime management
@@ -85,49 +91,72 @@ struct curl_request_context {
     curl_request request;
 };
 
+// Efficient incremental tracker host counting for dynamic connection pool scaling
+class tracker_host_counter {
+private:
+    std::unordered_map<std::string, int> m_tracker_ref_counts;
+    mutable std::mutex m_mutex;
+    
+public:
+    // Called when a tracker is added to any torrent
+    void add_tracker(const std::string& url);
+    
+    // Called when a tracker is removed from any torrent
+    void remove_tracker(const std::string& url);
+    
+    // Get current unique host count
+    size_t unique_count() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_tracker_ref_counts.size();
+    }
+    
+    // Clear all counts (for shutdown)
+    void clear() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_tracker_ref_counts.clear();
+    }
+};
+
 class TORRENT_EXPORT curl_thread_manager : public std::enable_shared_from_this<curl_thread_manager> {
 public:
-    // Factory method for safe shared_ptr creation
     static std::shared_ptr<curl_thread_manager> create(
         io_context& ios, session_settings const& settings);
     
     ~curl_thread_manager();
     
-    // Thread-safe request submission
     void add_request(
         std::string const& url,
         std::function<void(error_code, std::vector<char>)> handler,
         time_duration timeout = seconds(30));
     
-    // Graceful shutdown
     void shutdown();
     
+    void tracker_added(const std::string& url);
+    void tracker_removed(const std::string& url);
+    
+    curl_thread_stats get_stats() const;
+    
 private:
-    // Private constructor for factory pattern
     curl_thread_manager(io_context& ios, session_settings const& settings);
     
-    // Main thread function
     void curl_thread_func();
     
-    // Centralized configuration for CURL handles (new and retries)
-    bool configure_handle(CURL* easy, curl_request const& req);
+    bool configure_handle(CURL* easy, curl_request const& req, curl_transfer_data* transfer_data);
     
     // Process completed transfers. Returns the number of completions processed.
     int process_completions(CURLM* multi);
     
-    // Handle retry logic
     void schedule_retry(curl_request req);
     
-    // Calculate optimal wait timeout for curl_multi_wait
     long calculate_wait_timeout(CURLM* multi) const;
     
-    // Thread-safe queue operations with minimal locking
+    long calculate_optimal_connections() const;
+    
     std::vector<curl_request> swap_pending_requests();
     
     // Wakeup the curl thread (requires libcurl 7.68.0+)
     void wakeup_curl_thread();
     
-    // New timer-based batching methods
     void process_queue_notification();
     void on_timer(boost::system::error_code const& ec);
     void perform_wakeup();
@@ -136,12 +165,11 @@ private:
     // Memory pool for response buffers with fine-grained locking
     class response_buffer_pool {
     public:
-        static constexpr size_t SMALL_BUFFER_SIZE = 4096;
-        static constexpr size_t MEDIUM_BUFFER_SIZE = 32768;
-        static constexpr size_t LARGE_BUFFER_SIZE = 131072;
+        static constexpr size_t SMALL_BUFFER_SIZE = 2048;     // 2KB - covers 90% of tracker responses
+        static constexpr size_t MEDIUM_BUFFER_SIZE = 8192;    // 8KB - covers 8% of tracker responses
+        static constexpr size_t LARGE_BUFFER_SIZE = 65536;    // 64KB - covers 2% of tracker responses
         
         std::shared_ptr<response_data> acquire(size_t expected_size) {
-            // Select appropriate pool and its mutex
             if (expected_size <= SMALL_BUFFER_SIZE) {
                 std::lock_guard<std::mutex> lock(m_small_mutex);
                 return acquire_from_pool(m_small_pool, SMALL_BUFFER_SIZE, expected_size);
@@ -159,30 +187,34 @@ private:
             
             size_t capacity = buffer->buffer.capacity();
             
-            // Return to appropriate pool with fine-grained locking
             if (capacity <= SMALL_BUFFER_SIZE) {
                 std::lock_guard<std::mutex> lock(m_small_mutex);
-                if (m_small_pool.size() < MAX_POOL_SIZE) {
+                if (m_small_pool.size() < MAX_SMALL_POOL_SIZE) {
                     buffer->buffer.clear();
                     m_small_pool.push_back(std::move(buffer));
                 }
             } else if (capacity <= MEDIUM_BUFFER_SIZE) {
                 std::lock_guard<std::mutex> lock(m_medium_mutex);
-                if (m_medium_pool.size() < MAX_POOL_SIZE) {
+                if (m_medium_pool.size() < MAX_MEDIUM_POOL_SIZE) {
                     buffer->buffer.clear();
                     m_medium_pool.push_back(std::move(buffer));
                 }
-            } else {
+            } else if (capacity <= LARGE_BUFFER_SIZE) {
                 std::lock_guard<std::mutex> lock(m_large_mutex);
-                if (m_large_pool.size() < MAX_POOL_SIZE) {
+                if (m_large_pool.size() < MAX_LARGE_POOL_SIZE) {
                     buffer->buffer.clear();
                     m_large_pool.push_back(std::move(buffer));
                 }
             }
+            // Buffers larger than LARGE_BUFFER_SIZE are not pooled
         }
         
     private:
-        static constexpr size_t MAX_POOL_SIZE = 50;
+        // Pool sizes optimized for HTTP/2 (HTTP/1.1 will naturally use less)
+        // With 1000 concurrent streams: 900 small + 80 medium + 20 large
+        static constexpr size_t MAX_SMALL_POOL_SIZE = 900;   // 1.8MB when full
+        static constexpr size_t MAX_MEDIUM_POOL_SIZE = 80;   // 640KB when full  
+        static constexpr size_t MAX_LARGE_POOL_SIZE = 20;    // 1.3MB when full
         
         std::shared_ptr<response_data> acquire_from_pool(
             std::vector<std::shared_ptr<response_data>>& pool,
@@ -197,7 +229,6 @@ private:
                 return buffer;
             }
             
-            // Create new buffer if pool is empty
             auto buffer = std::make_shared<response_data>();
             buffer->buffer.reserve(reserve_size);
             buffer->max_size = max_size;
@@ -218,10 +249,11 @@ private:
     io_context& m_ios;
     session_settings const& m_settings;
     
-    // Thread and synchronization
+    // Store CA certificate path to prevent string lifetime issues
+    std::string m_ca_cert_path;
+    
     std::thread m_curl_thread;
     
-    // Initialization synchronization
     enum class InitStatus {
         Pending,
         Success,
@@ -231,14 +263,12 @@ private:
     std::condition_variable m_init_cv;
     InitStatus m_init_status = InitStatus::Pending;
     
-    // Request queue synchronization
-    std::mutex m_queue_mutex;
+    mutable std::mutex m_queue_mutex;
     std::queue<curl_request> m_request_queue;
     
     // Multi handle (thread-safe for curl_multi_wakeup)
     std::atomic<CURLM*> m_multi_handle{nullptr};
     
-    // Shutdown control
     std::atomic<bool> m_shutting_down{false};
     
     // Timer-based wakeup batching mechanism
@@ -246,9 +276,9 @@ private:
     deadline_timer m_wakeup_timer;              // Accessed ONLY on IO thread
     bool m_timer_running = false;               // Accessed ONLY on IO thread  
     std::atomic<bool> m_notification_pending{false}; // Cross-thread notification
+    std::atomic<uint64_t> m_notification_version{0}; // Version counter for debugging
     
     // Active requests tracking (only accessed from curl thread)
-    // Uses shared_ptr for automatic memory management
     std::unordered_map<CURL*, std::shared_ptr<curl_request_context>> m_active_requests;
     
     // Retry queue (only accessed from curl thread)
@@ -264,14 +294,22 @@ private:
     };
     std::multiset<retry_item> m_retry_queue;
     
-    // Performance metrics
     std::atomic<int> m_total_requests{0};
     std::atomic<int> m_completed_requests{0};
     std::atomic<int> m_failed_requests{0};
     std::atomic<int> m_retried_requests{0};
     
-    // Memory pool for response buffers
     response_buffer_pool m_buffer_pool;
+    
+    tracker_host_counter m_tracker_counter;
+    
+    mutable std::atomic<long> m_current_connection_limit{10};
+    
+    // Flag to indicate pool needs immediate update (removes 30s delay)
+    std::atomic<bool> m_pool_needs_update{false};
+    
+    // New connection limit to apply (calculated in tracker_added/removed)
+    std::atomic<long> m_new_connection_limit{10};
 };
 
 }} // namespace libtorrent::aux

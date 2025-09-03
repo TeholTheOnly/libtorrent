@@ -391,6 +391,15 @@ namespace aux {
 			// ``router.bt.ouinet.work:6881``,
 			dht_bootstrap_nodes,
 
+			// ``tracker_ca_certificate`` specifies the path to a custom CA
+			// certificate bundle file (in PEM format) to use for verifying
+			// HTTPS tracker connections. If empty (the default), the system's
+			// default CA bundle will be used. This is particularly useful for
+			// testing with self-signed certificates or when using a private
+			// certificate authority. The file must contain one or more CA
+			// certificates in PEM format. Only applies when using libcurl.
+			tracker_ca_certificate,
+
 			max_string_setting_internal
 		};
 
@@ -1054,6 +1063,16 @@ namespace aux {
 			// enabled to have any effect. Only applies when using libcurl.
 			// Default: true.
 			tracker_ssl_verify_host,
+
+			// ``proxy_force_internal_addresses`` controls whether internal/localhost
+			// addresses bypass the proxy (default secure behavior) or are forced
+			// through the proxy. When false (default), localhost and private IP
+			// ranges bypass the proxy for security (prevents SSRF attacks).
+			// When true, ALL addresses including localhost are forced through the
+			// proxy. WARNING: Only enable if you trust your proxy server with
+			// internal traffic. This setting only applies when using libcurl for
+			// tracker connections. Default: false.
+			proxy_force_internal_addresses,
 
 			max_bool_setting_internal
 		};

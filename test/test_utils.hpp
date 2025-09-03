@@ -104,8 +104,7 @@ inline bool run_io_context_until(lt::io_context& ios, Duration timeout, std::fun
 		// Restart the io_context in case it stopped
 		ios.restart();
 		
-		// Run the io_context for a short time to process handlers
-		// This is more reliable than poll() for ensuring all handlers get processed
+		// Use run_for() instead of poll() to ensure all handlers get processed reliably
 		ios.run_for(milliseconds(10));
 		
 		// Small delay to allow worker thread to post more handlers

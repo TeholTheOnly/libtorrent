@@ -43,6 +43,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/io_context.hpp"
 #include "libtorrent/error_code.hpp"
 #include "libtorrent/aux_/time.hpp"
+#include "libtorrent/random.hpp"
 
 #include <memory>
 #include <atomic>
@@ -51,11 +52,11 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <string>
 #include <thread>
 #include <iostream>
+#include <fstream>
 
 #ifdef __linux__
 #include <sys/resource.h>
 #include <unistd.h>
-#include <fstream>
 #include <sstream>
 #endif
 
@@ -66,7 +67,6 @@ using namespace std::chrono;
 namespace {
 
 #ifdef __linux__
-// Helper function to get CPU usage statistics for the current process
 struct cpu_stats {
     long user_time;
     long system_time;
@@ -98,7 +98,6 @@ cpu_stats get_process_cpu_stats() {
     return stats;
 }
 
-// Calculate CPU usage percentage over a time period
 double calculate_cpu_usage(cpu_stats start, cpu_stats end, std::chrono::milliseconds duration) {
     long ticks_per_second = sysconf(_SC_CLK_TCK);
     long cpu_ticks_used = (end.user_time - start.user_time) + (end.system_time - start.system_time);
@@ -107,14 +106,12 @@ double calculate_cpu_usage(cpu_stats start, cpu_stats end, std::chrono::millisec
     return (cpu_seconds_used / wall_seconds) * 100.0;
 }
 
-// Helper to get process memory usage
 size_t get_process_memory() {
     struct rusage usage;
     getrusage(RUSAGE_SELF, &usage);
     return static_cast<size_t>(usage.ru_maxrss * 1024); // Convert to bytes
 }
 #else
-// Fallback for non-Linux systems
 struct cpu_stats { long user_time; long system_time; };
 cpu_stats get_process_cpu_stats() { return {0, 0}; }
 double calculate_cpu_usage(cpu_stats, cpu_stats, std::chrono::milliseconds) { return 0.0; }
@@ -123,25 +120,20 @@ size_t get_process_memory() { return 0; }
 
 } // anonymous namespace
 
-// Test 1: Verify thread doesn't spin when idle (no 100% CPU)
 TORRENT_TEST(idle_cpu_usage)
 {
     io_context ios;
     settings_pack pack;
     session_settings settings(pack);
     
-    // Create curl thread manager
     auto mgr = curl_thread_manager::create(ios, settings);
     
-    // Let it run idle for a moment to stabilize
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     
 #ifdef __linux__
-    // Measure CPU usage while idle
     auto start_stats = get_process_cpu_stats();
     auto start_time = std::chrono::steady_clock::now();
     
-    // Let the manager run idle for 2 seconds
     std::this_thread::sleep_for(std::chrono::seconds(2));
     
     auto end_stats = get_process_cpu_stats();
@@ -159,7 +151,6 @@ TORRENT_TEST(idle_cpu_usage)
     std::this_thread::sleep_for(std::chrono::seconds(1));
 #endif
     
-    // Make a simple request to verify it's working
     std::atomic<bool> completed{false};
     error_code result_ec;
     
@@ -169,7 +160,6 @@ TORRENT_TEST(idle_cpu_usage)
             completed = true;
         }, seconds(1));
     
-    // Run io_context to process callbacks
     bool success = run_io_context_until(ios, seconds(3), [&]() { return completed.load(); });
     
     TEST_CHECK(success);
@@ -178,14 +168,12 @@ TORRENT_TEST(idle_cpu_usage)
         TEST_CHECK(result_ec == errors::timed_out || result_ec == errors::http_error);
     }
     
-    // Verify clean shutdown without hanging
     mgr->shutdown();
     
     // If we get here without hanging, basic functionality works
     TEST_CHECK(true);
 }
 
-// Test 2: Verify proper wakeup mechanism
 TORRENT_TEST(wakeup_mechanism)
 {
     io_context ios;
@@ -194,16 +182,14 @@ TORRENT_TEST(wakeup_mechanism)
     
     auto mgr = curl_thread_manager::create(ios, settings);
     
-    // Test that thread wakes up properly when new work arrives
-    // Wait a bit to ensure thread is idle
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     
-    // Now add a request - thread should wake up immediately
     std::atomic<bool> completed{false};
     auto start = std::chrono::steady_clock::now();
     
     mgr->add_request("http://127.0.0.1:1/", // Non-responsive
         [&completed](error_code const& ec, std::vector<char> const&) {
+            (void)ec;
             completed = true;
         }, seconds(1));
     
@@ -219,16 +205,13 @@ TORRENT_TEST(wakeup_mechanism)
     mgr->shutdown();
 }
 
-// Test 3: RAII wrapper tests
 TORRENT_TEST(curl_handle_raii)
 {
-    // Test construction and destruction
     {
         curl_easy_handle handle;
         TEST_CHECK(handle.get() != nullptr);
-    } // Should cleanup automatically
+    }
     
-    // Test move semantics
     {
         curl_easy_handle h1;
         CURL* ptr1 = h1.get();
@@ -238,7 +221,6 @@ TORRENT_TEST(curl_handle_raii)
         TEST_CHECK(h2.get() == ptr1);
     }
     
-    // Test exception safety
     {
         curl_easy_handle handle;
         try {
@@ -250,7 +232,6 @@ TORRENT_TEST(curl_handle_raii)
     }
 }
 
-// Test 4: SSRF prevention - redirects disabled
 TORRENT_TEST(ssrf_redirect_disabled)
 {
     io_context ios;
@@ -264,13 +245,19 @@ TORRENT_TEST(ssrf_redirect_disabled)
     std::atomic<bool> completed{false};
     error_code result_ec;
     
-    mgr->add_request("http://httpbin.org/redirect/1",
+    char data_buffer[3216];
+    aux::random_bytes(data_buffer);
+    std::ofstream("test_file").write(data_buffer, 3216);
+    int http_port = start_web_server();
+    
+    std::string redirect_url = "http://127.0.0.1:" + std::to_string(http_port) + "/redirect";
+    mgr->add_request(redirect_url,
         [&completed, &result_ec](error_code const& ec, std::vector<char> const& response) {
+            (void)response;
             result_ec = ec;
             completed = true;
         });
     
-    // Run the io_context
     run_io_context_until(ios, seconds(5), [&]() { return completed.load(); });
     
     error_code ec = result_ec;
@@ -283,7 +270,6 @@ TORRENT_TEST(ssrf_redirect_disabled)
     mgr->shutdown();
 }
 
-// Test 5: TLS version enforcement
 TORRENT_TEST(tls_version_enforcement)
 {
     io_context ios;
@@ -295,14 +281,17 @@ TORRENT_TEST(tls_version_enforcement)
     session_settings settings(pack);
     auto mgr = curl_thread_manager::create(ios, settings);
     
-    // This test would ideally connect to a server that only supports TLS 1.1
-    // Since that's hard to guarantee, we just verify the setting is applied
-    // In production, this would prevent downgrade attacks
+    char data_buffer[3216];
+    aux::random_bytes(data_buffer);
+    std::ofstream("test_file").write(data_buffer, 3216);
+    int https_port = start_web_server(true); // SSL enabled for HTTPS
+    
+    std::string https_url = "https://127.0.0.1:" + std::to_string(https_port) + "/test_file";
     
     std::atomic<bool> completed{false};
     error_code result_ec;
     
-    mgr->add_request("https://www.google.com/",
+    mgr->add_request(https_url,
         [&completed, &result_ec](error_code const& ec, std::vector<char> const&) {
             result_ec = ec;
             completed = true;
@@ -324,7 +313,6 @@ TORRENT_TEST(tls_version_enforcement)
     mgr->shutdown();
 }
 
-// Test 6: Memory pool efficiency
 TORRENT_TEST(memory_pool_usage)
 {
     io_context ios;
@@ -333,7 +321,6 @@ TORRENT_TEST(memory_pool_usage)
     
     auto mgr = curl_thread_manager::create(ios, settings);
     
-    // Track memory before making requests
     size_t initial_memory = get_process_memory();
     
     // Make multiple requests to non-existent local addresses
@@ -350,7 +337,6 @@ TORRENT_TEST(memory_pool_usage)
             }, seconds(1));
     }
     
-    // Process all requests
     bool success = run_io_context_until(ios, seconds(10), [&completed_count, num_requests]() {
         return completed_count >= num_requests;
     });
@@ -368,7 +354,6 @@ TORRENT_TEST(memory_pool_usage)
     mgr->shutdown();
 }
 
-// Test 7: Proxy credential security
 TORRENT_TEST(proxy_credentials_secure)
 {
     io_context ios;
@@ -392,7 +377,6 @@ TORRENT_TEST(proxy_credentials_secure)
     mgr->shutdown();
 }
 
-// Test 8: Verify curl_multi_poll timeout behavior
 TORRENT_TEST(curl_multi_poll_timeout)
 {
     io_context ios;
@@ -406,7 +390,6 @@ TORRENT_TEST(curl_multi_poll_timeout)
     
     auto start = std::chrono::steady_clock::now();
     
-    // Let it run idle for exactly 1 second
     std::this_thread::sleep_for(std::chrono::seconds(1));
     
     auto elapsed = std::chrono::steady_clock::now() - start;
@@ -419,7 +402,6 @@ TORRENT_TEST(curl_multi_poll_timeout)
     mgr->shutdown();
 }
 
-// Test 9: Concurrent requests with proper cleanup
 TORRENT_TEST(concurrent_requests_cleanup)
 {
     io_context ios;
@@ -435,13 +417,13 @@ TORRENT_TEST(concurrent_requests_cleanup)
     for (int i = 0; i < num_requests; ++i) {
         mgr->add_request("http://127.0.0.1:" + std::to_string(20000 + i) + "/",
             [&completed_count](error_code const& ec, std::vector<char> const&) {
+                (void)ec;
                 // Mark as completed regardless of error
                 completed_count++;
             }, seconds(1));
     }
     
-    // Process requests
-    bool success = run_io_context_until(ios, seconds(3), [&completed_count, num_requests]() {
+    run_io_context_until(ios, seconds(3), [&completed_count, num_requests]() {
         return completed_count >= num_requests;
     });
     
@@ -452,6 +434,12 @@ TORRENT_TEST(concurrent_requests_cleanup)
     TEST_CHECK(completed == 5);
     
     mgr->shutdown();
+}
+
+#else // TORRENT_USE_LIBCURL
+
+TORRENT_TEST(idle_cpu_usage)
+{
 }
 
 #endif // TORRENT_USE_LIBCURL
