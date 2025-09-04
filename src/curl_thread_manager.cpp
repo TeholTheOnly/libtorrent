@@ -325,7 +325,6 @@ namespace {
                 std::fprintf(stderr, "WARNING: SSL certificate verification disabled for tracker connections\n");
             });
 #endif
-            #endif
 
             // In production builds, log a more severe warning
             #ifdef TORRENT_PRODUCTION
