@@ -37,7 +37,6 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/aux_/curl_tracker_client.hpp"
 #include "libtorrent/aux_/escape_string.hpp"
 #include "libtorrent/hex.hpp"
-#include "libtorrent/http2_errors.hpp"
 #include "libtorrent/socket_io.hpp"
 #include "libtorrent/peer_info.hpp"
 #include "libtorrent/aux_/listen_socket_handle.hpp"

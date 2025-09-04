@@ -340,7 +340,6 @@ set(sources
 	http_seed_connection.cpp
 	http_tracker_connection.cpp
 	curl_tracker_connection.cpp
-	http2_errors.cpp
 	aux_/curl_tracker_client.cpp
 	aux_/curl_thread_manager.cpp
 	i2p_stream.cpp

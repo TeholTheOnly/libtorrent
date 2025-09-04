@@ -192,7 +192,6 @@ run test_crc32.cpp ;
 run test_ffs.cpp ;
 run test_ed25519.cpp ;
 run test_gzip.cpp ;
-run test_http2_errors.cpp ;
 run test_tracker_interface.cpp ;
 # Disabled - curl_tracker_manager was integrated into tracker_manager
 # run test_curl_tracker_manager.cpp ;

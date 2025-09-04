@@ -819,7 +819,6 @@ SOURCES =
 	drive_info
 	entry
 	error_code
-	http2_errors
 	file_storage
 	escape_string
 	string_util
